@@ -126,14 +126,24 @@ Toutes les `HISTORY_SECS` :
 3. Toute erreur (cookies invalides, format YouTube changé) → log en warning et on
    continue. Ne doit **jamais** faire planter le démon ni bloquer la détection locale.
 
-## Lancement auto (launchd)
+## Lancement auto (launchd) — 2 agents
 
-`~/Library/LaunchAgents/com.ytstock.plist` :
-- `ProgramArguments` : `python3 <chemin>/ytstock.py daemon`
-- `RunAtLoad = true`, `KeepAlive = true` (redémarre si crash ou reboot)
-- `StandardOutPath` / `StandardErrorPath` → `.ytstock/ytstock.log`
+- **`com.ytstock.plist`** (démon) : `daemon`, `RunAtLoad`+`KeepAlive`. Surveille les
+  visionnages (lsof) + refill périodique.
+- **`com.ytstock.netrefill.plist`** : `refill` déclenché par `WatchPaths` sur les
+  fichiers de config réseau → **télécharge à chaque connexion internet**.
+  `ThrottleInterval=120`. Pour l'usage nomade (télécharge quand on capte du WiFi).
 
-Installation : `launchctl load -w ~/Library/LaunchAgents/com.ytstock.plist`.
+Installation : `launchctl load -w` sur les deux.
+
+### ⚠️ Pièges launchd rencontrés en vrai (corrigés) — indispensables pour réinstaller
+
+1. **PATH minimal.** launchd lance avec `PATH=/usr/bin:/bin:/usr/sbin:/sbin` → `yt-dlp`
+   et `aria2c` (dans `/opt/homebrew/bin`) sont **introuvables**. → `EnvironmentVariables`
+   `PATH` incluant `/opt/homebrew/bin` dans les deux plists.
+2. **`~/Downloads` protégé (TCC).** launchd ne peut pas y écrire son `StandardOutPath`
+   → l'agent échoue en **`EX_CONFIG (78)`** sans rien logger. → logs redirigés vers
+   `~/Library/Logs/ytstock.log`. (Le process Python, lui, accède bien aux vidéos.)
 
 ## Gestion des erreurs (principes)
 
