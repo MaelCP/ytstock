@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ytstock.netrefill</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>/Users/satoshi/Downloads/videos/ytstock.py</string>
+    <string>refill</string>
+  </array>
+  <!-- lancé quand la config réseau change (= connexion internet) -->
+  <key>WatchPaths</key>
+  <array>
+    <string>/etc/resolv.conf</string>
+    <string>/Library/Preferences/SystemConfiguration/NetworkInterfaces.plist</string>
+    <string>/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <!-- au plus 1 refill / 2 min, même si le réseau clignote -->
+  <key>ThrottleInterval</key><integer>120</integer>
+  <key>StandardOutPath</key><string>/Users/satoshi/Downloads/videos/.ytstock/ytstock.log</string>
+  <key>StandardErrorPath</key><string>/Users/satoshi/Downloads/videos/.ytstock/ytstock.log</string>
+</dict>
+</plist>

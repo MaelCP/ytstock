@@ -18,6 +18,7 @@ WATCH_FILE   = STATE_DIR / "watch.json"
 LOG_FILE     = STATE_DIR / "ytstock.log"
 THUMBS_DIR   = STATE_DIR / "thumbs"          # miniatures locales (offline), 1 par id
 CANDIDATES_FILE = STATE_DIR / "candidates.json"   # cache des candidats classés
+FAILS_FILE   = STATE_DIR / "fails.json"      # compteur d'échecs de download par id
 
 BUDGET_BYTES = 15 * 1024**3
 MAX_HEIGHT   = 720
@@ -315,6 +316,36 @@ def load_candidates():
         return []
 
 
+MAX_FAILS = 3   # au-delà, on abandonne un id (vidéo cassée) au lieu de boucler
+
+
+def load_fails():
+    if not FAILS_FILE.exists():
+        return {}
+    try:
+        return json.loads(FAILS_FILE.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
+def record_fail(vid):
+    """Download raté : on réessaiera au prochain refill (utile sur réseau instable).
+    Après MAX_FAILS on abandonne (marque seen) pour ne pas boucler sur un id cassé."""
+    fails = load_fails()
+    fails[vid] = fails.get(vid, 0) + 1
+    if fails[vid] >= MAX_FAILS:
+        add_seen(vid)
+        fails.pop(vid, None)
+        log(f"download abandon {vid} après {MAX_FAILS} échecs")
+    _atomic_write(FAILS_FILE, json.dumps(fails))
+
+
+def clear_fail(vid):
+    fails = load_fails()
+    if fails.pop(vid, None) is not None:
+        _atomic_write(FAILS_FILE, json.dumps(fails))
+
+
 def refill():
     ensure_state_dir()
     seed_seen_from_disk()
@@ -337,8 +368,11 @@ def refill():
             if needs_more(dir_used_bytes()):
                 log(f"refill: pick {m['id']} score={engagement_score(m):.1f} "
                     f"(likes={m['like']} coms={m['comment']} vues={m['view']})")
-                download(m["id"])
-                add_seen(m["id"])   # succès ou échec : pas de re-tentative en boucle
+                if download(m["id"]):
+                    add_seen(m["id"])
+                    clear_fail(m["id"])
+                else:
+                    record_fail(m["id"])  # réessai prochain refill (réseau instable)
             else:
                 leftovers.append(m)  # pas téléchargé -> candidat pour l'UI
     if i > 0:                       # on a évalué qqch (pas offline) -> rafraîchit le cache
@@ -602,6 +636,9 @@ def serve():
                 ok = download(vid)
                 if ok:
                     add_seen(vid)
+                    clear_fail(vid)
+                else:
+                    record_fail(vid)
                 self._json({"ok": ok})
             else:
                 self.send_error(404)
@@ -657,11 +694,12 @@ def run_self_check():
     assert needs_more(BUDGET_BYTES + 1) is False
 
     # Task 4 & 6: Persistent state and mark_watched (nested in temp dir)
-    global STATE_DIR, SEEN_FILE, WATCH_FILE, VIDEO_DIR
-    _saved_state = (STATE_DIR, SEEN_FILE, WATCH_FILE)
+    global STATE_DIR, SEEN_FILE, WATCH_FILE, VIDEO_DIR, FAILS_FILE
+    _saved_state = (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE)
     _saved_vd = VIDEO_DIR
     _tmp = Path(tempfile.mkdtemp())
     STATE_DIR, SEEN_FILE, WATCH_FILE = _tmp, _tmp / "seen.txt", _tmp / "watch.json"
+    FAILS_FILE = _tmp / "fails.json"
     VIDEO_DIR = _tmp
     try:
         ensure_state_dir()
@@ -687,8 +725,19 @@ def run_self_check():
         (_tmp / "Autre [eeeeeeeeeee].mp4").write_text("x")
         seed_seen_from_disk()
         assert "eeeeeeeeeee" in load_seen()
+
+        # retry : échec -> compte, pas seen ; MAX_FAILS -> abandon (seen)
+        for _ in range(MAX_FAILS - 1):
+            record_fail("ggggggggggg")
+        assert "ggggggggggg" not in load_seen()       # encore réessayable
+        assert load_fails().get("ggggggggggg") == MAX_FAILS - 1
+        record_fail("ggggggggggg")                     # atteint le seuil
+        assert "ggggggggggg" in load_seen()            # abandonné
+        assert "ggggggggggg" not in load_fails()
+        record_fail("hhhhhhhhhhh"); clear_fail("hhhhhhhhhhh")
+        assert "hhhhhhhhhhh" not in load_fails()        # succès efface le compteur
     finally:
-        STATE_DIR, SEEN_FILE, WATCH_FILE = _saved_state
+        STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE = _saved_state
         VIDEO_DIR = _saved_vd
         shutil.rmtree(_tmp, ignore_errors=True)
 
