@@ -223,9 +223,26 @@ def seed_seen_from_disk():
             add_seen(vid)
 
 
+def sweep_stale_partials():
+    """Supprime les .part/.aria2 abandonnés (download interrompu). Ils sont hors
+    budget (exclus par VIDEO_EXTS) donc rempliraient le disque sans limite.
+    Seuil > timeout de download : un partial 'vieux' n'est jamais actif."""
+    import time as _t
+    cutoff = _t.time() - 3600
+    for p in VIDEO_DIR.glob("*"):
+        if p.suffix in (".part", ".aria2", ".ytdl") and p.is_file():
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    log(f"swept stale partial {p.name}")
+            except OSError:
+                pass
+
+
 def refill():
     ensure_state_dir()
     seed_seen_from_disk()
+    sweep_stale_partials()
     used = dir_used_bytes()
     if not needs_more(used):
         log(f"refill: full ({used // 1024**2} MiB), rien à faire")
