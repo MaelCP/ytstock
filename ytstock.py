@@ -28,6 +28,9 @@ THEMES       = ["philosophie", "ARTE", "psychologie", "documentaire", "NBA"]
 PLAYERS      = ["VLC", "IINA", "QuickTime", "mpv"]
 VIDEO_EXTS   = {".mp4", ".webm", ".mkv"}
 COOKIES_BROWSER = "firefox"       # firefox = pas de prompt Trousseau (contrairement à chrome)
+METADATA_CHUNK  = 25              # nb de candidats dont on fetch les métadonnées par passe
+MIN_VIEWS       = 500             # plancher : sous ça le ratio d'engagement = bruit
+MIN_LIKES       = 20             # idem
 
 
 # Task 1: ID extraction
@@ -240,6 +243,52 @@ def sweep_stale_partials():
                 pass
 
 
+def fetch_metadata(ids):
+    """Extraction complète (lente, ~5s/vidéo) : like/comment/view/duration/live.
+    Indispensable pour classer par engagement — indisponible en flat-playlist."""
+    if not ids:
+        return []
+    cmd = ["yt-dlp", "--no-download", "--ignore-errors",
+           "--cookies-from-browser", COOKIES_BROWSER,
+           "--print", "%(id)s\t%(like_count)s\t%(comment_count)s\t%(view_count)s\t%(duration)s\t%(live_status)s"]
+    cmd += [f"https://www.youtube.com/watch?v={i}" for i in ids]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * len(ids))
+    except (subprocess.SubprocessError, OSError) as e:
+        log(f"fetch_metadata error: {e}")
+        return []
+    metas = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 6 or len(parts[0]) != 11:
+            continue
+        vid, like, com, view, dur, live = parts
+        metas.append({
+            "id": vid,
+            "like": int(like) if like.isdigit() else 0,
+            "comment": int(com) if com.isdigit() else 0,
+            "view": int(view) if view.isdigit() else 0,
+            "duration": int(dur) if dur.isdigit() else None,
+            "live_status": None if live in ("NA", "None", "") else live,
+        })
+    return metas
+
+
+def engagement_score(m):
+    """Taux d'engagement, indépendant de la taille de la chaîne : une petite
+    vidéo très likée/commentée bat un gros buzz tiède. 0 si vues inconnues."""
+    v = m["view"]
+    if v <= 0:
+        return 0.0
+    return (m["like"] / v) * 100 + (m["comment"] / v) * 500
+
+
+def enough_signal(m):
+    """Écarte les vidéos trop peu vues/likées : à 24 vues le ratio explose mais
+    c'est du bruit, pas une bonne vidéo. Plancher à régler via MIN_VIEWS/MIN_LIKES."""
+    return m["view"] >= MIN_VIEWS and m["like"] >= MIN_LIKES
+
+
 def refill():
     ensure_state_dir()
     seed_seen_from_disk()
@@ -249,16 +298,26 @@ def refill():
         log(f"refill: full ({used // 1024**2} MiB), rien à faire")
         return
     log(f"refill: {used // 1024**2} MiB utilisés, budget {BUDGET_BYTES // 1024**2} MiB")
-    seen = load_seen()
-    # limite par source large : on filtre beaucoup, on veut assez de candidats
-    candidates = [c for c in gather_candidates(40) if is_wanted(c, seen)]
-    log(f"refill: {len(candidates)} candidats retenus")
-    for c in candidates:
-        if not needs_more(dir_used_bytes()):
-            break
-        vid = c["id"]
-        download(vid)
-        add_seen(vid)  # succès ou échec : évite de re-tenter en boucle un ID cassé
+    pool = [c for c in gather_candidates(40) if is_wanted(c, load_seen())]
+    log(f"refill: {len(pool)} candidats à évaluer par chunks de {METADATA_CHUNK}")
+    # On récupère les métadonnées par chunks (coûteux) : juste assez pour remplir.
+    # Chaque chunk est classé par engagement décroissant avant download.
+    i = 0
+    while needs_more(dir_used_bytes()) and i < len(pool):
+        chunk = [c["id"] for c in pool[i:i + METADATA_CHUNK]]
+        i += METADATA_CHUNK
+        seen = load_seen()
+        good = [m for m in fetch_metadata(chunk)
+                if is_wanted(m, seen) and enough_signal(m)]
+        good.sort(key=engagement_score, reverse=True)
+        for m in good:
+            if not needs_more(dir_used_bytes()):
+                break
+            vid = m["id"]
+            log(f"refill: pick {vid} score={engagement_score(m):.1f} "
+                f"(likes={m['like']} coms={m['comment']} vues={m['view']})")
+            download(vid)
+            add_seen(vid)  # succès ou échec : évite de re-tenter en boucle un ID cassé
     log(f"refill: terminé, {dir_used_bytes() // 1024**2} MiB")
 
 
@@ -359,6 +418,15 @@ def run_self_check():
     assert is_wanted({"id": "ddddddddddd", "duration": 99999, "live_status": None}, seen) is False   # too long
     assert is_wanted({"id": "eeeeeeeeeee", "duration": 600, "live_status": "is_live"}, seen) is False # live
     assert is_wanted({"id": "fffffffffff", "duration": None, "live_status": None}, seen) is True      # unknown duration
+
+    # engagement_score : ratio, indépendant de la taille de la chaîne
+    assert engagement_score({"like": 10, "comment": 0, "view": 0}) == 0.0  # pas de /0
+    hot = engagement_score({"like": 125, "comment": 32, "view": 2570})     # petite très engageante
+    meh = engagement_score({"like": 50000, "comment": 100, "view": 5000000})  # gros buzz tiède
+    assert hot > meh
+    # plancher de signal : écarte le bruit à ~24 vues, garde les vidéos crédibles
+    assert enough_signal({"like": 125, "comment": 32, "view": 2570}) is True
+    assert enough_signal({"like": 4, "comment": 1, "view": 24}) is False
 
     # Task 3: needs_more
     assert needs_more(0) is True
