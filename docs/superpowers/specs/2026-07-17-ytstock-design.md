@@ -20,12 +20,13 @@ vidéos), 720p max, en arrière-plan sans intervention.
 | Qualité | **720p max** |
 | Sources | Abonnements (`:ytsubs`) + recommandations (`:ytrec`) + recherche par thème (`ytsearch`) |
 | Thèmes | philosophie, ARTE, psychologie, documentaire, NBA |
+| Sélection | Classement par **taux d'engagement** = (likes/vues)·100 + (coms/vues)·500, plancher MIN_VIEWS=500 / MIN_LIKES=20 pour écarter le bruit ; fetch métadonnées par chunks de 25 |
 | « Vue » locale | Auto via `lsof` — fichier ouvert ≥ 90s par un lecteur puis refermé |
 | « Vue » online | Bonus best-effort via `yt-dlp :ythistory` |
 | Automatisme | Full auto en arrière-plan via `launchd` (survit au reboot) |
-| Cookies | `--cookies-from-browser chrome` |
+| Cookies | `--cookies-from-browser firefox` (chrome = prompt Trousseau à chaque accès) |
 | Téléchargeur | `yt-dlp` + `--external-downloader aria2c` |
-| Filtres | Exclure Shorts (< 90s), lives, doublons déjà vus |
+| Filtres | Exclure Shorts (< 90s), lives (`--match-filters !is_live`), doublons déjà vus |
 
 ## Environnement (déjà en place)
 
