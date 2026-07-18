@@ -10,6 +10,7 @@ import tempfile
 import shutil
 import subprocess
 import time
+import fcntl
 
 VIDEO_DIR    = Path.home() / "Downloads" / "videos"
 STATE_DIR    = VIDEO_DIR / ".ytstock"
@@ -348,6 +349,24 @@ def clear_fail(vid):
 
 def refill():
     ensure_state_dir()
+    # Verrou : daemon + netrefill peuvent appeler refill en même temps. Un seul à
+    # la fois, sinon deux downloads concurrents se marchent dessus (double fichier,
+    # seen.txt entrelacé). flock non-bloquant : si occupé, on laisse l'autre finir.
+    lock = open(STATE_DIR / "refill.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("refill: déjà en cours ailleurs, skip")
+        lock.close()
+        return
+    try:
+        _refill()
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
+def _refill():
     seed_seen_from_disk()
     sweep_stale_partials()
     log(f"refill: {dir_used_bytes() // 1024**2} MiB / {BUDGET_BYTES // 1024**2} MiB")
