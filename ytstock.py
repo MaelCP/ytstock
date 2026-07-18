@@ -7,6 +7,7 @@ import json
 import os
 import datetime
 import tempfile
+import subprocess
 
 VIDEO_DIR    = Path.home() / "Downloads" / "videos"
 STATE_DIR    = VIDEO_DIR / ".ytstock"
@@ -143,6 +144,67 @@ def mark_watched(video_id, reason):
         log(f"watched ({reason}) -> deleted {p.name}")
     else:
         log(f"watched ({reason}) {video_id} (no local file)")
+
+
+# Task 7: Candidate listing via yt-dlp
+def list_source(source, limit):
+    cmd = [
+        "yt-dlp", "--flat-playlist", "--ignore-errors",
+        "--cookies-from-browser", "chrome",
+        "--playlist-end", str(limit),
+        "--print", "%(id)s\t%(duration)s\t%(live_status)s",
+        source,
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (subprocess.SubprocessError, OSError) as e:
+        log(f"list_source error {source}: {e}")
+        return []
+    cands = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3 or len(parts[0]) != 11:
+            continue
+        vid, dur, live = parts
+        duration = int(dur) if dur.isdigit() else None
+        cands.append({"id": vid, "duration": duration,
+                      "live_status": None if live in ("NA", "None", "") else live})
+    return cands
+
+
+def gather_candidates(limit_per_source):
+    sources = [":ytsubs", ":ytrec"]
+    sources += [f'ytsearch{limit_per_source}:"{t}"' for t in THEMES]
+    seen_ids, out = set(), []
+    for src in sources:
+        for c in list_source(src, limit_per_source):
+            if c["id"] not in seen_ids:
+                seen_ids.add(c["id"])
+                out.append(c)
+    return out
+
+
+# Task 8: Download via yt-dlp + aria2c
+def download(video_id):
+    out_tmpl = str(VIDEO_DIR / "%(title)s [%(id)s].%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]",
+        "--external-downloader", "aria2c",
+        "--external-downloader-args", "aria2c:-x16 -s16 -k1M",
+        "--cookies-from-browser", "chrome",
+        "--no-playlist", "--no-part",
+        "-o", out_tmpl,
+        "--", video_id,
+    ]
+    try:
+        r = subprocess.run(cmd, timeout=3600)
+        ok = r.returncode == 0
+    except (subprocess.SubprocessError, OSError) as e:
+        log(f"download error {video_id}: {e}")
+        ok = False
+    log(f"download {'ok' if ok else 'FAIL'} {video_id}")
+    return ok
 
 
 def run_self_check():
