@@ -10,9 +10,12 @@
     <string>/Users/satoshi/Downloads/videos/ytstock.py</string>
     <string>daemon</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/satoshi/Downloads/videos/.ytstock/ytstock.log</string>
-  <key>StandardErrorPath</key><string>/Users/satoshi/Downloads/videos/.ytstock/ytstock.log</string>
+  <!-- log hors ~/Downloads : dossier protégé TCC, launchd ne peut pas y écrire -->
+  <key>StandardOutPath</key><string>/Users/satoshi/Library/Logs/ytstock.log</string>
+  <key>StandardErrorPath</key><string>/Users/satoshi/Library/Logs/ytstock.log</string>
 </dict>
 </plist>

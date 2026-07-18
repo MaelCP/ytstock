@@ -10,7 +10,8 @@
     <string>/Users/satoshi/Downloads/videos/ytstock.py</string>
     <string>refill</string>
   </array>
-  <!-- lancé quand la config réseau change (= connexion internet) -->
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>WatchPaths</key>
   <array>
     <string>/etc/resolv.conf</string>
@@ -18,9 +19,8 @@
     <string>/Library/Preferences/SystemConfiguration/com.apple.airport.preferences.plist</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <!-- au plus 1 refill / 2 min, même si le réseau clignote -->
   <key>ThrottleInterval</key><integer>120</integer>
-  <key>StandardOutPath</key><string>/Users/satoshi/Downloads/videos/.ytstock/ytstock.log</string>
-  <key>StandardErrorPath</key><string>/Users/satoshi/Downloads/videos/.ytstock/ytstock.log</string>
+  <key>StandardOutPath</key><string>/Users/satoshi/Library/Logs/ytstock.log</string>
+  <key>StandardErrorPath</key><string>/Users/satoshi/Library/Logs/ytstock.log</string>
 </dict>
 </plist>
