@@ -16,6 +16,8 @@ STATE_DIR    = VIDEO_DIR / ".ytstock"
 SEEN_FILE    = STATE_DIR / "seen.txt"
 WATCH_FILE   = STATE_DIR / "watch.json"
 LOG_FILE     = STATE_DIR / "ytstock.log"
+THUMBS_DIR   = STATE_DIR / "thumbs"          # miniatures locales (offline), 1 par id
+CANDIDATES_FILE = STATE_DIR / "candidates.json"   # cache des candidats classés
 
 BUDGET_BYTES = 15 * 1024**3
 MAX_HEIGHT   = 720
@@ -31,6 +33,7 @@ COOKIES_BROWSER = "firefox"       # firefox = pas de prompt Trousseau (contraire
 METADATA_CHUNK  = 25              # nb de candidats dont on fetch les métadonnées par passe
 MIN_VIEWS       = 500             # plancher : sous ça le ratio d'engagement = bruit
 MIN_LIKES       = 20             # idem
+SERVE_PORT      = 8787            # interface web locale
 
 
 # Task 1: ID extraction
@@ -192,7 +195,9 @@ def gather_candidates(limit_per_source):
 
 # Task 8: Download via yt-dlp + aria2c
 def download(video_id):
+    THUMBS_DIR.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(VIDEO_DIR / "%(title)s [%(id)s].%(ext)s")
+    thumb_tmpl = "thumbnail:" + str(THUMBS_DIR / "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
         "-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]",
@@ -203,9 +208,12 @@ def download(video_id):
         # rejette lives/premieres : sinon un live à durée inconnue passe le filtre
         # candidat et bloque le démon mono-thread jusqu'au timeout (1h).
         "--match-filters", "!is_live & !is_upcoming",
+        # miniature locale (offline) rangée par id dans .ytstock/thumbs/
+        "--write-thumbnail", "--convert-thumbnails", "jpg",
         # pas de --no-part : les .part interrompus ne comptent pas dans le budget
         # (exclus par VIDEO_EXTS) et yt-dlp reprend/nettoie proprement.
         "-o", out_tmpl,
+        "-o", thumb_tmpl,
         "--", video_id,
     ]
     try:
@@ -250,7 +258,7 @@ def fetch_metadata(ids):
         return []
     cmd = ["yt-dlp", "--no-download", "--ignore-errors",
            "--cookies-from-browser", COOKIES_BROWSER,
-           "--print", "%(id)s\t%(like_count)s\t%(comment_count)s\t%(view_count)s\t%(duration)s\t%(live_status)s"]
+           "--print", "%(id)s\t%(like_count)s\t%(comment_count)s\t%(view_count)s\t%(duration)s\t%(live_status)s\t%(title)s"]
     cmd += [f"https://www.youtube.com/watch?v={i}" for i in ids]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * len(ids))
@@ -260,9 +268,9 @@ def fetch_metadata(ids):
     metas = []
     for line in out.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 6 or len(parts[0]) != 11:
+        if len(parts) != 7 or len(parts[0]) != 11:
             continue
-        vid, like, com, view, dur, live = parts
+        vid, like, com, view, dur, live, title = parts
         metas.append({
             "id": vid,
             "like": int(like) if like.isdigit() else 0,
@@ -270,6 +278,7 @@ def fetch_metadata(ids):
             "view": int(view) if view.isdigit() else 0,
             "duration": int(dur) if dur.isdigit() else None,
             "live_status": None if live in ("NA", "None", "") else live,
+            "title": title,
         })
     return metas
 
@@ -289,21 +298,35 @@ def enough_signal(m):
     return m["view"] >= MIN_VIEWS and m["like"] >= MIN_LIKES
 
 
+def save_candidates(metas):
+    """Écrit le top 50 (non vus, triés engagement) pour l'onglet 'à télécharger'."""
+    seen = load_seen()
+    ranked = sorted((m for m in metas if m["id"] not in seen),
+                    key=engagement_score, reverse=True)[:50]
+    _atomic_write(CANDIDATES_FILE, json.dumps(ranked))
+
+
+def load_candidates():
+    if not CANDIDATES_FILE.exists():
+        return []
+    try:
+        return json.loads(CANDIDATES_FILE.read_text())
+    except (ValueError, OSError):
+        return []
+
+
 def refill():
     ensure_state_dir()
     seed_seen_from_disk()
     sweep_stale_partials()
-    used = dir_used_bytes()
-    if not needs_more(used):
-        log(f"refill: full ({used // 1024**2} MiB), rien à faire")
-        return
-    log(f"refill: {used // 1024**2} MiB utilisés, budget {BUDGET_BYTES // 1024**2} MiB")
+    log(f"refill: {dir_used_bytes() // 1024**2} MiB / {BUDGET_BYTES // 1024**2} MiB")
+    # candidats en flat (rapide) -> métadonnées par chunks (coûteux) -> classement.
     pool = [c for c in gather_candidates(40) if is_wanted(c, load_seen())]
-    log(f"refill: {len(pool)} candidats à évaluer par chunks de {METADATA_CHUNK}")
-    # On récupère les métadonnées par chunks (coûteux) : juste assez pour remplir.
-    # Chaque chunk est classé par engagement décroissant avant download.
-    i = 0
-    while needs_more(dir_used_bytes()) and i < len(pool):
+    leftovers, i = [], 0
+    while i < len(pool):
+        # stop dès que le budget est plein ET qu'on a de quoi alimenter l'UI
+        if not needs_more(dir_used_bytes()) and leftovers:
+            break
         chunk = [c["id"] for c in pool[i:i + METADATA_CHUNK]]
         i += METADATA_CHUNK
         seen = load_seen()
@@ -311,14 +334,16 @@ def refill():
                 if is_wanted(m, seen) and enough_signal(m)]
         good.sort(key=engagement_score, reverse=True)
         for m in good:
-            if not needs_more(dir_used_bytes()):
-                break
-            vid = m["id"]
-            log(f"refill: pick {vid} score={engagement_score(m):.1f} "
-                f"(likes={m['like']} coms={m['comment']} vues={m['view']})")
-            download(vid)
-            add_seen(vid)  # succès ou échec : évite de re-tenter en boucle un ID cassé
-    log(f"refill: terminé, {dir_used_bytes() // 1024**2} MiB")
+            if needs_more(dir_used_bytes()):
+                log(f"refill: pick {m['id']} score={engagement_score(m):.1f} "
+                    f"(likes={m['like']} coms={m['comment']} vues={m['view']})")
+                download(m["id"])
+                add_seen(m["id"])   # succès ou échec : pas de re-tentative en boucle
+            else:
+                leftovers.append(m)  # pas téléchargé -> candidat pour l'UI
+    if i > 0:                       # on a évalué qqch (pas offline) -> rafraîchit le cache
+        save_candidates(leftovers)
+    log(f"refill: terminé, {dir_used_bytes() // 1024**2} MiB, {len(leftovers)} candidats en cache")
 
 
 def sync_history():
@@ -402,6 +427,199 @@ def status():
     print(f"démon      : {running}")
 
 
+# ---------------------------------------------------------------------------
+# Interface web locale (stdlib http.server, marche hors ligne pour le stock)
+# ---------------------------------------------------------------------------
+def title_from_name(name):
+    """'Titre [id].mp4' -> 'Titre'."""
+    return re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\.[^.]+$", "", name)
+
+
+def stock_items():
+    items = []
+    for p in sorted(list_stock_files(), key=lambda x: x.stat().st_mtime, reverse=True):
+        vid = id_from_name(p.name)
+        if not vid:
+            continue
+        items.append({
+            "id": vid,
+            "title": title_from_name(p.name),
+            "size_mib": p.stat().st_size // 1024**2,
+            "thumb": (THUMBS_DIR / f"{vid}.jpg").exists(),
+        })
+    return items
+
+
+def backfill_thumbs():
+    """Récupère les miniatures manquantes du stock (best-effort, online)."""
+    THUMBS_DIR.mkdir(parents=True, exist_ok=True)
+    missing = [it["id"] for it in stock_items() if not it["thumb"]]
+    if not missing:
+        return
+    cmd = ["yt-dlp", "--skip-download", "--write-thumbnail",
+           "--convert-thumbnails", "jpg", "--ignore-errors",
+           "--cookies-from-browser", COOKIES_BROWSER,
+           "-o", "thumbnail:" + str(THUMBS_DIR / "%(id)s.%(ext)s")]
+    cmd += [f"https://www.youtube.com/watch?v={i}" for i in missing]
+    try:
+        subprocess.run(cmd, timeout=60 * len(missing) + 30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+
+PAGE = """<!doctype html><html lang=fr><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>ytstock</title><style>
+*{box-sizing:border-box}body{margin:0;font:15px/1.4 -apple-system,system-ui,sans-serif;
+background:#111;color:#eee}header{position:sticky;top:0;background:#181818;
+padding:14px 20px;border-bottom:1px solid #2a2a2a;display:flex;gap:16px;align-items:center}
+h1{font-size:17px;margin:0;font-weight:600}.bar{color:#9a9a9a;font-size:13px}
+.bar b{color:#eee}main{padding:20px;max-width:1200px;margin:0 auto}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#8a8a8a;
+margin:26px 0 12px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
+gap:16px}.card{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden;
+display:flex;flex-direction:column}.thumb{aspect-ratio:16/9;background:#000;object-fit:cover;
+width:100%;display:block}.ph{aspect-ratio:16/9;background:linear-gradient(135deg,#242424,#161616);
+display:flex;align-items:center;justify-content:center;color:#444;font-size:32px}
+.body{padding:10px 12px;flex:1;display:flex;flex-direction:column;gap:8px}
+.t{font-size:13px;font-weight:500;line-height:1.35;max-height:3.4em;overflow:hidden}
+.meta{font-size:12px;color:#8a8a8a}.row{display:flex;gap:8px;margin-top:auto}
+button{flex:1;border:0;border-radius:7px;padding:8px;font-size:13px;font-weight:600;
+cursor:pointer;color:#fff}.play{background:#2d6cdf}.del{background:#3a2020;color:#e88;flex:0 0 auto}
+.dl{background:#227a4b}button:disabled{opacity:.4;cursor:not-allowed}
+.empty{color:#666;padding:20px 0}.off{color:#c96;font-size:12px}
+</style></head><body>
+<header><h1>🎬 ytstock</h1><div class=bar id=bar>…</div></header>
+<main>
+<h2>En stock — à regarder</h2><div class=grid id=stock></div>
+<h2>À télécharger — les plus engageantes <span class=off id=offnote></span></h2>
+<div class=grid id=cand></div>
+</main>
+<script>
+const online = navigator.onLine;
+async function j(u,o){const r=await fetch(u,o);return r.json()}
+function card(html){const d=document.createElement('div');d.className='card';d.innerHTML=html;return d}
+function thumbStock(it){return it.thumb?`<img class=thumb src="/thumb/${it.id}">`:`<div class=ph>🎬</div>`}
+async function post(u){try{const r=await j(u,{method:'POST'});return r}catch(e){return {ok:false,err:'offline'}}}
+async function load(){
+ const st=await j('/api/stock');
+ const el=document.getElementById('stock');el.innerHTML='';
+ let mib=0;
+ st.forEach(it=>{mib+=it.size_mib;
+  const c=card(`${thumbStock(it)}<div class=body><div class=t>${esc(it.title)}</div>
+   <div class=meta>${it.size_mib} Mo</div>
+   <div class=row><button class=play>▶ Lancer</button><button class=del>🗑</button></div></div>`);
+  c.querySelector('.play').onclick=async e=>{e.target.textContent='…';await post('/api/open?id='+it.id);e.target.textContent='▶ Lancer'};
+  c.querySelector('.del').onclick=async()=>{if(confirm('Supprimer « '+it.title+' » ?')){await post('/api/delete?id='+it.id);load()}};
+  el.appendChild(c)});
+ if(!st.length)el.innerHTML='<div class=empty>Rien en stock pour l\\'instant.</div>';
+ document.getElementById('bar').innerHTML=`<b>${st.length}</b> vidéos · <b>${(mib/1024).toFixed(1)}</b> Go`;
+ const cd=await j('/api/candidates');
+ const ce=document.getElementById('cand');ce.innerHTML='';
+ document.getElementById('offnote').textContent=online?'':'(hors ligne — téléchargement indispo)';
+ cd.forEach(m=>{
+  const c=card(`<img class=thumb src="https://i.ytimg.com/vi/${m.id}/mqdefault.jpg" onerror="this.outerHTML='<div class=ph>🎬</div>'">
+   <div class=body><div class=t>${esc(m.title||m.id)}</div>
+   <div class=meta>❤ ${m.like} · 💬 ${m.comment} · 👁 ${m.view}</div>
+   <div class=row><button class=dl ${online?'':'disabled'}>⬇ Télécharger</button></div></div>`);
+  const b=c.querySelector('.dl');
+  if(online)b.onclick=async()=>{b.textContent='téléchargement…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent='échec';setTimeout(()=>{b.textContent='⬇ Télécharger';b.disabled=false},2000)}};
+  ce.appendChild(c)});
+ if(!cd.length)ce.innerHTML='<div class=empty>Pas encore de candidats (lance un refill en ligne).</div>';
+}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+load();
+</script></body></html>"""
+
+
+def serve():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+    import threading
+    ensure_state_dir()
+    # backfill des miniatures en tâche de fond : ne bloque pas le démarrage du
+    # serveur (sinon l'UI met 30-60s à répondre le temps de récupérer les images).
+    threading.Thread(target=backfill_thumbs, daemon=True).start()
+
+    def valid_id(v):
+        return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", v or ""))
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _bytes(self, data, ctype, code=200):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, obj, code=200):
+            self._bytes(json.dumps(obj).encode(), "application/json", code)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/":
+                self._bytes(PAGE.encode(), "text/html; charset=utf-8")
+            elif path == "/api/stock":
+                self._json(stock_items())
+            elif path == "/api/candidates":
+                self._json(load_candidates())
+            elif path.startswith("/thumb/"):
+                vid = path[len("/thumb/"):]
+                f = THUMBS_DIR / f"{vid}.jpg"
+                if valid_id(vid) and f.exists():
+                    self._bytes(f.read_bytes(), "image/jpeg")
+                else:
+                    self.send_error(404)
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            # anti-CSRF simple : un autre site enverrait un Origin différent
+            origin = self.headers.get("Origin")
+            allowed = (None, f"http://127.0.0.1:{SERVE_PORT}",
+                       f"http://localhost:{SERVE_PORT}")
+            if origin not in allowed:
+                return self.send_error(403)
+            path = urlparse(self.path).path
+            vid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+            if not valid_id(vid):
+                return self._json({"ok": False, "err": "bad id"}, 400)
+            if path == "/api/open":
+                p = path_for_id(vid)
+                if p:
+                    subprocess.Popen(["open", "-a", "VLC", str(p)])
+                    self._json({"ok": True})
+                else:
+                    self._json({"ok": False, "err": "not found"}, 404)
+            elif path == "/api/delete":
+                mark_watched(vid, "ui")
+                self._json({"ok": True})
+            elif path == "/api/download":
+                ok = download(vid)
+                if ok:
+                    add_seen(vid)
+                self._json({"ok": ok})
+            else:
+                self.send_error(404)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", SERVE_PORT), H)
+    url = f"http://127.0.0.1:{SERVE_PORT}"
+    log(f"serve: {url}")
+    print(f"ytstock UI → {url}  (Ctrl-C pour arrêter)")
+    try:
+        subprocess.Popen(["open", url])
+    except OSError:
+        pass
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 def run_self_check():
     # Task 1: id_from_name
     assert id_from_name("History of the world [xuCn8ux2gbs].mp4") == "xuCn8ux2gbs"
@@ -427,6 +645,10 @@ def run_self_check():
     # plancher de signal : écarte le bruit à ~24 vues, garde les vidéos crédibles
     assert enough_signal({"like": 125, "comment": 32, "view": 2570}) is True
     assert enough_signal({"like": 4, "comment": 1, "view": 24}) is False
+
+    # title_from_name : retire le suffixe [id].ext pour l'UI
+    assert title_from_name("La honte ｜ ARTE [0z8W4XQ6KOo].webm") == "La honte ｜ ARTE"
+    assert title_from_name("no id here.mp4") == "no id here.mp4"
 
     # Task 3: needs_more
     assert needs_more(0) is True
@@ -499,8 +721,10 @@ def main(argv):
         daemon()
     elif cmd == "status":
         status()
+    elif cmd == "serve":
+        serve()
     else:
-        print("usage: ytstock.py [daemon|refill|status|--self-check]")
+        print("usage: ytstock.py [daemon|refill|status|serve|--self-check]")
         return 1
     return 0
 
