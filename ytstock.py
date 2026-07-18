@@ -207,6 +207,40 @@ def download(video_id):
     return ok
 
 
+def refill():
+    ensure_state_dir()
+    used = dir_used_bytes()
+    if not needs_more(used):
+        log(f"refill: full ({used // 1024**2} MiB), rien à faire")
+        return
+    log(f"refill: {used // 1024**2} MiB utilisés, budget {BUDGET_BYTES // 1024**2} MiB")
+    seen = load_seen()
+    # limite par source large : on filtre beaucoup, on veut assez de candidats
+    candidates = [c for c in gather_candidates(40) if is_wanted(c, seen)]
+    log(f"refill: {len(candidates)} candidats retenus")
+    for c in candidates:
+        if not needs_more(dir_used_bytes()):
+            break
+        vid = c["id"]
+        if download(vid):
+            add_seen(vid)
+        else:
+            add_seen(vid)  # évite de re-tenter en boucle un ID cassé
+    log(f"refill: terminé, {dir_used_bytes() // 1024**2} MiB")
+
+
+def sync_history():
+    try:
+        watched_online = {c["id"] for c in list_source(":ythistory", 50)}
+    except Exception as e:            # best-effort, jamais fatal
+        log(f"sync_history error: {e}")
+        return
+    local_ids = {id_from_name(p.name) for p in list_stock_files()}
+    local_ids.discard(None)
+    for vid in watched_online & local_ids:
+        mark_watched(vid, "online")
+
+
 def run_self_check():
     # Task 1: id_from_name
     assert id_from_name("History of the world [xuCn8ux2gbs].mp4") == "xuCn8ux2gbs"
