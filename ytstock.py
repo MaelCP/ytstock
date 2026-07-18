@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import time
 import fcntl
+import contextlib
 
 VIDEO_DIR    = Path.home() / "Downloads" / "videos"
 STATE_DIR    = VIDEO_DIR / ".ytstock"
@@ -45,6 +46,12 @@ _ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]\.[^.]+$")
 def id_from_name(name):
     m = _ID_RE.search(name)
     return m.group(1) if m else None
+
+
+def is_valid_id(v):
+    """Vrai id YouTube : 11 chars du charset attendu. Bloque tout id hostile
+    (injection HTML/URL) dès l'ingestion des métadonnées."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", v or ""))
 
 
 # Task 2: Filtering candidates
@@ -84,9 +91,19 @@ def ensure_state_dir():
 
 
 def _atomic_write(path, text):
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    # tmp unique (mkstemp) : deux écrivains concurrents ne partagent pas le même
+    # fichier temp -> pas de FileNotFoundError sur os.replace, pas de perte.
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def load_seen():
@@ -174,7 +191,7 @@ def list_source(source, limit):
     cands = []
     for line in out.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3 or len(parts[0]) != 11:
+        if len(parts) != 3 or not is_valid_id(parts[0]):
             continue
         vid, dur, live = parts
         duration = int(dur) if dur.isdigit() else None
@@ -270,7 +287,7 @@ def fetch_metadata(ids):
     metas = []
     for line in out.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 7 or len(parts[0]) != 11:
+        if len(parts) != 7 or not is_valid_id(parts[0]):
             continue
         vid, like, com, view, dur, live, title = parts
         metas.append({
@@ -347,23 +364,31 @@ def clear_fail(vid):
         _atomic_write(FAILS_FILE, json.dumps(fails))
 
 
-def refill():
+@contextlib.contextmanager
+def download_lock():
+    """Sérialise TOUT ce qui télécharge (refill démon/netrefill ET download UI),
+    sinon deux yt-dlp écrivent le même fichier. Non-bloquant : yield False si occupé."""
     ensure_state_dir()
-    # Verrou : daemon + netrefill peuvent appeler refill en même temps. Un seul à
-    # la fois, sinon deux downloads concurrents se marchent dessus (double fichier,
-    # seen.txt entrelacé). flock non-bloquant : si occupé, on laisse l'autre finir.
     lock = open(STATE_DIR / "refill.lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        log("refill: déjà en cours ailleurs, skip")
         lock.close()
+        yield False
         return
     try:
-        _refill()
+        yield True
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+
+
+def refill():
+    with download_lock() as got:
+        if not got:
+            log("refill: déjà en cours ailleurs, skip")
+            return
+        _refill()
 
 
 def _refill():
@@ -394,7 +419,7 @@ def _refill():
                     record_fail(m["id"])  # réessai prochain refill (réseau instable)
             else:
                 leftovers.append(m)  # pas téléchargé -> candidat pour l'UI
-    if i > 0:                       # on a évalué qqch (pas offline) -> rafraîchit le cache
+    if leftovers:                   # ne vide pas le cache pendant le remplissage / offline
         save_candidates(leftovers)
     log(f"refill: terminé, {dir_used_bytes() // 1024**2} MiB, {len(leftovers)} candidats en cache")
 
@@ -577,7 +602,7 @@ async function load(){
    <div class=meta>❤ ${m.like} · 💬 ${m.comment} · 👁 ${m.view}</div>
    <div class=row><button class=dl ${online?'':'disabled'}>⬇ Télécharger</button></div></div>`);
   const b=c.querySelector('.dl');
-  if(online)b.onclick=async()=>{b.textContent='téléchargement…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent='échec';setTimeout(()=>{b.textContent='⬇ Télécharger';b.disabled=false},2000)}};
+  if(online)b.onclick=async()=>{b.textContent='téléchargement…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent=r.busy?'démon occupé…':'échec';setTimeout(()=>{b.textContent='⬇ Télécharger';b.disabled=false},2500)}};
   ce.appendChild(c)});
  if(!cd.length)ce.innerHTML='<div class=empty>Pas encore de candidats (lance un refill en ligne).</div>';
 }
@@ -594,9 +619,7 @@ def serve():
     # backfill des miniatures en tâche de fond : ne bloque pas le démarrage du
     # serveur (sinon l'UI met 30-60s à répondre le temps de récupérer les images).
     threading.Thread(target=backfill_thumbs, daemon=True).start()
-
-    def valid_id(v):
-        return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", v or ""))
+    valid_id = is_valid_id
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -652,12 +675,15 @@ def serve():
                 mark_watched(vid, "ui")
                 self._json({"ok": True})
             elif path == "/api/download":
-                ok = download(vid)
-                if ok:
-                    add_seen(vid)
-                    clear_fail(vid)
-                else:
-                    record_fail(vid)
+                with download_lock() as got:
+                    if not got:                       # démon en train de télécharger
+                        return self._json({"ok": False, "busy": True})
+                    ok = download(vid)
+                    if ok:
+                        add_seen(vid)
+                        clear_fail(vid)
+                    else:
+                        record_fail(vid)
                 self._json({"ok": ok})
             else:
                 self.send_error(404)
@@ -705,6 +731,12 @@ def run_self_check():
     # title_from_name : retire le suffixe [id].ext pour l'UI
     assert title_from_name("La honte ｜ ARTE [0z8W4XQ6KOo].webm") == "La honte ｜ ARTE"
     assert title_from_name("no id here.mp4") == "no id here.mp4"
+
+    # is_valid_id : charset strict (bloque injection via id de 11 chars hostile)
+    assert is_valid_id("0z8W4XQ6KOo") is True
+    assert is_valid_id('"><script>x') is False   # 11 chars mais charset interdit
+    assert is_valid_id("../etc/pass") is False
+    assert is_valid_id("short") is False
 
     # Task 3: needs_more
     assert needs_more(0) is True
