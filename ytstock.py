@@ -176,7 +176,7 @@ def list_source(source, limit):
 
 def gather_candidates(limit_per_source):
     sources = [":ytsubs", ":ytrec"]
-    sources += [f'ytsearch{limit_per_source}:"{t}"' for t in THEMES]
+    sources += [f'ytsearch{limit_per_source}:{t}' for t in THEMES]
     seen_ids, out = set(), []
     for src in sources:
         for c in list_source(src, limit_per_source):
@@ -195,7 +195,12 @@ def download(video_id):
         "--external-downloader", "aria2c",
         "--external-downloader-args", "aria2c:-x16 -s16 -k1M",
         "--cookies-from-browser", "chrome",
-        "--no-playlist", "--no-part",
+        "--no-playlist",
+        # rejette lives/premieres : sinon un live à durée inconnue passe le filtre
+        # candidat et bloque le démon mono-thread jusqu'au timeout (1h).
+        "--match-filters", "!is_live & !is_upcoming",
+        # pas de --no-part : les .part interrompus ne comptent pas dans le budget
+        # (exclus par VIDEO_EXTS) et yt-dlp reprend/nettoie proprement.
         "-o", out_tmpl,
         "--", video_id,
     ]
@@ -209,8 +214,18 @@ def download(video_id):
     return ok
 
 
+def seed_seen_from_disk():
+    """Marque comme 'seen' les vidéos déjà présentes, pour ne pas les
+    re-télécharger si elles ressurgissent comme candidates."""
+    for p in list_stock_files():
+        vid = id_from_name(p.name)
+        if vid:
+            add_seen(vid)
+
+
 def refill():
     ensure_state_dir()
+    seed_seen_from_disk()
     used = dir_used_bytes()
     if not needs_more(used):
         log(f"refill: full ({used // 1024**2} MiB), rien à faire")
@@ -242,9 +257,16 @@ def sync_history():
 
 
 def open_video_ids():
+    # -a ANDe (liste des lecteurs) AVEC (+D dossier) : on ne compte QUE les
+    # fichiers ouverts par un vrai lecteur. Sans ça, Time Machine / Spotlight /
+    # iCloud — et surtout aria2c pendant un download — feraient supprimer des
+    # vidéos jamais regardées.
+    cmd = ["lsof", "-a"]
+    for player in PLAYERS:
+        cmd += ["-c", player]
+    cmd += ["+D", str(VIDEO_DIR), "-F", "n"]
     try:
-        out = subprocess.run(["lsof", "-F", "n", "+D", str(VIDEO_DIR)],
-                             capture_output=True, text=True, timeout=30)
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (subprocess.SubprocessError, OSError):
         return set()
     ids = set()
@@ -259,16 +281,22 @@ def open_video_ids():
 def daemon():
     ensure_state_dir()
     log("daemon start")
+    seed_seen_from_disk()
     acc = load_watch()
     last_history = 0.0
     while True:
         try:
             watched, acc = watcher_tick(open_video_ids(), acc)
-            save_watch(acc)
+            # supprimer AVANT de sauver l'accumulateur : si save_watch échoue,
+            # les vidéos vues sont déjà supprimées/marquées et pas perdues.
             did_delete = bool(watched)
             for vid in watched:
                 mark_watched(vid, "local")
+            save_watch(acc)
 
+            # ponytail: refill()/download() bloquent la boucle (donc la détection
+            # lsof) le temps d'un téléchargement — mono-thread assumé. Passer à un
+            # thread de download séparé seulement si le blocage devient gênant.
             now = time.monotonic()
             if now - last_history >= HISTORY_SECS:
                 sync_history()
@@ -346,6 +374,11 @@ def run_self_check():
         mark_watched("ddddddddddd", "test")
         assert not f.exists()
         assert "ddddddddddd" in load_seen()
+
+        # seed_seen_from_disk : un fichier présent est marqué seen
+        (_tmp / "Autre [eeeeeeeeeee].mp4").write_text("x")
+        seed_seen_from_disk()
+        assert "eeeeeeeeeee" in load_seen()
     finally:
         STATE_DIR, SEEN_FILE, WATCH_FILE = _saved_state
         VIDEO_DIR = _saved_vd
