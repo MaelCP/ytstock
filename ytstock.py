@@ -7,6 +7,7 @@ import json
 import os
 import datetime
 import tempfile
+import shutil
 import subprocess
 import time
 
@@ -223,10 +224,8 @@ def refill():
         if not needs_more(dir_used_bytes()):
             break
         vid = c["id"]
-        if download(vid):
-            add_seen(vid)
-        else:
-            add_seen(vid)  # évite de re-tenter en boucle un ID cassé
+        download(vid)
+        add_seen(vid)  # succès ou échec : évite de re-tenter en boucle un ID cassé
     log(f"refill: terminé, {dir_used_bytes() // 1024**2} MiB")
 
 
@@ -266,10 +265,9 @@ def daemon():
         try:
             watched, acc = watcher_tick(open_video_ids(), acc)
             save_watch(acc)
-            did_delete = False
+            did_delete = bool(watched)
             for vid in watched:
                 mark_watched(vid, "local")
-                did_delete = True
 
             now = time.monotonic()
             if now - last_history >= HISTORY_SECS:
@@ -351,6 +349,7 @@ def run_self_check():
     finally:
         STATE_DIR, SEEN_FILE, WATCH_FILE = _saved_state
         VIDEO_DIR = _saved_vd
+        shutil.rmtree(_tmp, ignore_errors=True)
 
     # Task 5: watcher_tick
     # opening progressively
