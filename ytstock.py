@@ -8,6 +8,7 @@ import os
 import datetime
 import tempfile
 import subprocess
+import time
 
 VIDEO_DIR    = Path.home() / "Downloads" / "videos"
 STATE_DIR    = VIDEO_DIR / ".ytstock"
@@ -239,6 +240,63 @@ def sync_history():
     local_ids.discard(None)
     for vid in watched_online & local_ids:
         mark_watched(vid, "online")
+
+
+def open_video_ids():
+    try:
+        out = subprocess.run(["lsof", "-F", "n", "+D", str(VIDEO_DIR)],
+                             capture_output=True, text=True, timeout=30)
+    except (subprocess.SubprocessError, OSError):
+        return set()
+    ids = set()
+    for line in out.stdout.splitlines():
+        if line.startswith("n"):
+            vid = id_from_name(line[1:])
+            if vid:
+                ids.add(vid)
+    return ids
+
+
+def daemon():
+    ensure_state_dir()
+    log("daemon start")
+    acc = load_watch()
+    last_history = 0.0
+    while True:
+        try:
+            watched, acc = watcher_tick(open_video_ids(), acc)
+            save_watch(acc)
+            did_delete = False
+            for vid in watched:
+                mark_watched(vid, "local")
+                did_delete = True
+
+            now = time.monotonic()
+            if now - last_history >= HISTORY_SECS:
+                sync_history()
+                refill()
+                last_history = now
+            elif did_delete:
+                refill()
+        except Exception as e:                 # le démon ne meurt jamais
+            log(f"daemon loop error: {e}")
+        time.sleep(POLL_SECS)
+
+
+def status():
+    files = list_stock_files()
+    used = dir_used_bytes()
+    seen = load_seen()
+    try:
+        r = subprocess.run(["pgrep", "-f", "ytstock.py daemon"],
+                           capture_output=True, text=True)
+        running = "oui" if r.stdout.strip() else "non"
+    except OSError:
+        running = "?"
+    print(f"stock      : {len(files)} vidéos")
+    print(f"disque     : {used // 1024**2} MiB / {BUDGET_BYTES // 1024**2} MiB")
+    print(f"vues (seen): {len(seen)} IDs")
+    print(f"démon      : {running}")
 
 
 def run_self_check():
