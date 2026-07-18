@@ -27,6 +27,7 @@ HISTORY_SECS = 30 * 60
 THEMES       = ["philosophie", "ARTE", "psychologie", "documentaire", "NBA"]
 PLAYERS      = ["VLC", "IINA", "QuickTime", "mpv"]
 VIDEO_EXTS   = {".mp4", ".webm", ".mkv"}
+COOKIES_BROWSER = "firefox"       # firefox = pas de prompt Trousseau (contrairement à chrome)
 
 
 # Task 1: ID extraction
@@ -152,7 +153,7 @@ def mark_watched(video_id, reason):
 def list_source(source, limit):
     cmd = [
         "yt-dlp", "--flat-playlist", "--ignore-errors",
-        "--cookies-from-browser", "chrome",
+        "--cookies-from-browser", COOKIES_BROWSER,
         "--playlist-end", str(limit),
         "--print", "%(id)s\t%(duration)s\t%(live_status)s",
         source,
@@ -194,7 +195,7 @@ def download(video_id):
         "-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]",
         "--external-downloader", "aria2c",
         "--external-downloader-args", "aria2c:-x16 -s16 -k1M",
-        "--cookies-from-browser", "chrome",
+        "--cookies-from-browser", COOKIES_BROWSER,
         "--no-playlist",
         # rejette lives/premieres : sinon un live à durée inconnue passe le filtre
         # candidat et bloque le démon mono-thread jusqu'au timeout (1h).
