@@ -12,11 +12,12 @@ import subprocess
 import time
 import fcntl
 import contextlib
+import plistlib
+import urllib.parse
 
 VIDEO_DIR    = Path(os.environ.get("YTSTOCK_DIR", str(Path.home() / "Downloads" / "videos")))
 STATE_DIR    = VIDEO_DIR / ".ytstock"
 SEEN_FILE    = STATE_DIR / "seen.txt"
-WATCH_FILE   = STATE_DIR / "watch.json"
 LOG_FILE     = STATE_DIR / "ytstock.log"
 THUMBS_DIR   = STATE_DIR / "thumbs"          # miniatures locales (offline), 1 par id
 CANDIDATES_FILE = STATE_DIR / "candidates.json"   # cache des candidats classés
@@ -27,7 +28,10 @@ DISLIKES_FILE = STATE_DIR / "dislikes.json"  # 👎 LOCAUX -> évite ces chaîne
 
 BUDGET_BYTES = 15 * 1024**3
 MAX_HEIGHT   = 720
-WATCHED_SECS = 90
+# VLC garde la position de reprise par fichier dans ce plist (secondes). C'est
+# notre source de vérité pour "en cours" (position) et "fini" (proche de la fin).
+VLC_PLIST    = Path.home() / "Library/Preferences/org.videolan.vlc.plist"
+FINISH_MARGIN = 20   # à ≤ 20 s de la fin = vidéo finie -> supprimable. Réglable.
 MIN_DURATION = 90
 MAX_DURATION = 2 * 3600            # 0 = pas de limite
 POLL_SECS    = 15
@@ -137,28 +141,49 @@ def _load_json(path, default):
         return default
 
 
-def load_watch():
-    return _load_json(WATCH_FILE, {})
+# Task 5: Position de lecture via VLC (source de vérité pour "en cours" / "fini")
+def _id_from_mrl(mrl):
+    """'file:///.../Titre [id].webm' (URL) -> id ytstock, ou None."""
+    path = urllib.parse.unquote(mrl.split("file://", 1)[-1])
+    return id_from_name(Path(path).name)
 
 
-def save_watch(d):
-    _atomic_write(WATCH_FILE, json.dumps(d))
+def vlc_positions():
+    """{id: secondes} des positions de reprise sauvegardées par VLC. Vide si VLC
+    n'a jamais tourné. Ne lève jamais : un plist absent/corrompu -> {}."""
+    try:
+        d = plistlib.loads(VLC_PLIST.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return {}
+    out = {}
+    for mrl, pos in (d.get("recentlyPlayedMedia") or {}).items():
+        vid = _id_from_mrl(mrl)
+        if vid:
+            try:
+                out[vid] = int(float(pos))
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
-# Task 5: Watcher state machine
-def watcher_tick(open_ids, acc):
-    """Accumule le temps de visionnage PAR vidéo, persistant entre ouvertures.
-    Une vidéo est 'vue' quand elle a cumulé WATCHED_SECS ET qu'elle est refermée
-    (jamais pendant la lecture). Un visionnage partiel reste dans acc -> 'en cours',
-    et le temps s'additionne à la reprise."""
-    new_acc = dict(acc)
-    for vid in open_ids:
-        new_acc[vid] = new_acc.get(vid, 0) + POLL_SECS
-    watched = {vid for vid, secs in new_acc.items()
-               if vid not in open_ids and secs >= WATCHED_SECS}
-    for vid in watched:
-        new_acc.pop(vid, None)
-    return watched, new_acc
+def video_duration(path):
+    """Durée en secondes via ffprobe, ou None si indéterminable."""
+    if not path:
+        return None
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=30)
+        return int(float(out.stdout.strip()))
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def is_finished(pos, dur, open_now, margin=FINISH_MARGIN):
+    """Finie = position à ≤ margin secondes de la fin ET plus en lecture (on ne
+    supprime jamais une vidéo ouverte, même arrivée près de la fin)."""
+    return bool(dur) and not open_now and pos >= dur - margin
 
 
 # Task 6: Logging and file operations
@@ -613,21 +638,27 @@ def daemon():
     ensure_state_dir()
     log("daemon start")
     seed_seen_from_disk()
-    acc = load_watch()
+    durs = {}                      # cache durée (ffprobe) par id, le temps du run
     last_history = 0.0
     while True:
         try:
-            watched, acc = watcher_tick(open_video_ids(), acc)
-            # supprimer AVANT de sauver l'accumulateur : si save_watch échoue,
-            # les vidéos vues sont déjà supprimées/marquées et pas perdues.
-            did_delete = bool(watched)
-            for vid in watched:
-                mark_watched(vid, "local")
-            # purge des vidéos disparues du disque (supprimées via l'UI, etc.),
-            # sinon acc accumule des 'en cours' fantômes.
-            on_disk = {id_from_name(p.name) for p in list_stock_files()}
-            acc = {v: s for v, s in acc.items() if v in on_disk}
-            save_watch(acc)
+            # On ne supprime plus à la fermeture : on garde la vidéo (VLC reprend
+            # au bon timecode). On ne la supprime QUE si elle est finie (position
+            # VLC proche de la fin) et plus en lecture.
+            open_ids = open_video_ids()
+            positions = vlc_positions()
+            did_delete = False
+            for vid, sec in positions.items():
+                p = path_for_id(vid)
+                if not p:
+                    continue           # position VLC d'une vidéo absente -> ignore
+                dur = durs.get(vid)
+                if dur is None:
+                    dur = durs[vid] = video_duration(p)
+                if is_finished(sec, dur, vid in open_ids):
+                    mark_watched(vid, "finie")
+                    durs.pop(vid, None)
+                    did_delete = True
 
             # ponytail: refill()/download() bloquent la boucle (donc la détection
             # lsof) le temps d'un téléchargement — mono-thread assumé. Passer à un
@@ -703,7 +734,7 @@ def history_items():
 
 
 def stock_items():
-    acc = load_watch()   # temps de visionnage cumulé -> distingue "en cours"
+    pos = vlc_positions()   # position de reprise VLC -> "en cours" + timecode
     items = []
     for p in sorted(list_stock_files(), key=lambda x: x.stat().st_mtime, reverse=True):
         vid = id_from_name(p.name)
@@ -714,7 +745,7 @@ def stock_items():
             "title": title_from_name(p.name),
             "size_mib": p.stat().st_size // 1024**2,
             "thumb": (THUMBS_DIR / f"{vid}.jpg").exists(),
-            "watched_secs": int(acc.get(vid, 0)),   # >0 = commencée, non finie
+            "resume_secs": int(pos.get(vid, 0)),   # >0 = en cours, reprend ici
         })
     return items
 
@@ -814,7 +845,7 @@ function card(html){const d=document.createElement('div');d.className='card';d.i
 function thumbLocal(it){return it.thumb?`<img class=thumb src="/thumb/${it.id}">`:`<div class=ph>🎬</div>`}
 function fail(m){const e=document.getElementById('err');e.textContent=m;e.hidden=false}
 function ok(){document.getElementById('err').hidden=true}
-function fmt(s){return s<60?s+' s':Math.round(s/60)+' min'}
+function mmss(s){const m=Math.floor(s/60),x=s%60;return m+':'+String(x).padStart(2,'0')}
 // serveur arrêté != bouton cassé : on distingue panne réseau, statut HTTP, refus applicatif.
 async function post(u){let r;
  try{r=await fetch(u,{method:'POST'})}catch(e){fail('Serveur injoignable — relance : python3 ytstock.py serve');return {ok:false}}
@@ -834,10 +865,10 @@ function rateBtn(it,kind){const on=kind=='like'?it.liked:it.disliked, other=kind
  else b.onclick=async()=>{b.disabled=true;const r=await post('/api/'+kind+'?id='+it.id);if(r.ok){load()}else b.disabled=false};
  return b}
 function renderStock(st){
- const enc=st.filter(it=>it.watched_secs>0), fresh=st.filter(it=>!it.watched_secs);
+ const enc=st.filter(it=>it.resume_secs>0), fresh=st.filter(it=>!it.resume_secs);
  const ge=document.getElementById('g-encours');ge.innerHTML='';
  enc.forEach(it=>{const c=card(`${thumbLocal(it)}<div class=body><div class=t>${esc(it.title)}</div>
-   <div class=meta>⏱ ${fmt(it.watched_secs)} déjà vues · ${it.size_mib} Mo</div><div class=row></div></div>`);
+   <div class=meta>⏱ reprendre à ${mmss(it.resume_secs)} · ${it.size_mib} Mo</div><div class=row></div></div>`);
   c.querySelector('.row').append(playBtn(it,true),delBtn(it));ge.appendChild(c)});
  if(!enc.length)ge.innerHTML='<div class=empty>Aucune vidéo en cours.</div>';
  const gs=document.getElementById('g-stock');gs.innerHTML='';
@@ -1071,6 +1102,16 @@ def run_self_check():
     assert is_valid_id("../etc/pass") is False
     assert is_valid_id("short") is False
 
+    # _id_from_mrl : URL VLC -> id (gère l'encodage %20, unicode)
+    assert _id_from_mrl("file:///Users/x/Downloads/videos/Titre%20cool%20%5B0z8W4XQ6KOo%5D.webm") == "0z8W4XQ6KOo"
+    assert _id_from_mrl("file:///Users/x/Rick.and.Morty%5BEZTV%5D.mkv") is None   # pas un id ytstock
+
+    # is_finished : finie = proche de la fin ET plus en lecture
+    assert is_finished(pos=118, dur=124, open_now=False) is True     # 6 s de la fin
+    assert is_finished(pos=118, dur=124, open_now=True) is False     # encore ouverte
+    assert is_finished(pos=40, dur=600, open_now=False) is False     # à peine entamée
+    assert is_finished(pos=600, dur=None, open_now=False) is False   # durée inconnue -> jamais
+
     # Task 3: needs_more
     assert needs_more(0) is True
     assert needs_more(BUDGET_BYTES - 1) is True
@@ -1078,13 +1119,13 @@ def run_self_check():
     assert needs_more(BUDGET_BYTES + 1) is False
 
     # Task 4 & 6: Persistent state and mark_watched (nested in temp dir)
-    global STATE_DIR, SEEN_FILE, WATCH_FILE, VIDEO_DIR, FAILS_FILE
+    global STATE_DIR, SEEN_FILE, VIDEO_DIR, FAILS_FILE
     global HISTORY_FILE, LIKES_FILE, DISLIKES_FILE
-    _saved_state = (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE,
+    _saved_state = (STATE_DIR, SEEN_FILE, FAILS_FILE,
                     HISTORY_FILE, LIKES_FILE, DISLIKES_FILE)
     _saved_vd = VIDEO_DIR
     _tmp = Path(tempfile.mkdtemp())
-    STATE_DIR, SEEN_FILE, WATCH_FILE = _tmp, _tmp / "seen.txt", _tmp / "watch.json"
+    STATE_DIR, SEEN_FILE = _tmp, _tmp / "seen.txt"
     FAILS_FILE = _tmp / "fails.json"
     HISTORY_FILE, LIKES_FILE = _tmp / "history.json", _tmp / "likes.json"
     DISLIKES_FILE = _tmp / "dislikes.json"
@@ -1097,9 +1138,6 @@ def run_self_check():
         add_seen("bbbbbbbbbbb")
         assert load_seen() == {"aaaaaaaaaaa", "bbbbbbbbbbb"}
         assert SEEN_FILE.read_text().count("aaaaaaaaaaa") == 1
-        save_watch({"ccccccccccc": 45})
-        assert load_watch() == {"ccccccccccc": 45}
-        assert load_watch() != {}  # persists
 
         # Task 6: mark_watched
         f = _tmp / "Titre [ddddddddddd].mp4"
@@ -1165,31 +1203,10 @@ def run_self_check():
                           "view": 9999, "channel": "UC" + "c" * 22}])
         assert load_candidates() == []               # filtré (chaîne évitée)
     finally:
-        (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE,
+        (STATE_DIR, SEEN_FILE, FAILS_FILE,
          HISTORY_FILE, LIKES_FILE, DISLIKES_FILE) = _saved_state
         VIDEO_DIR = _saved_vd
         shutil.rmtree(_tmp, ignore_errors=True)
-
-    # Task 5: watcher_tick — le temps s'accumule et PERSISTE (visionnage partiel)
-    # ouverture progressive
-    watched, acc = watcher_tick({"a"}, {})
-    assert watched == set() and acc == {"a": POLL_SECS}
-    for _ in range(5):                          # 6 ticks * 15s = 90s
-        watched, acc = watcher_tick({"a"}, acc)
-    assert acc["a"] >= WATCHED_SECS and watched == set()
-    # fermée après le seuil => vue, oubliée
-    watched, acc = watcher_tick(set(), acc)
-    assert watched == {"a"} and "a" not in acc
-    # partiel puis fermée => PAS vue mais CONSERVÉE ("en cours")
-    _, acc2 = watcher_tick({"b"}, {})           # b à 15s
-    watched, acc2 = watcher_tick(set(), acc2)   # fermée avant seuil
-    assert watched == set() and acc2.get("b") == POLL_SECS
-    # reprise plus tard : le temps s'additionne jusqu'au seuil puis vue à la fermeture
-    for _ in range(6):
-        watched, acc2 = watcher_tick({"b"}, acc2)
-    assert watched == set() and acc2["b"] >= WATCHED_SECS   # pas supprimée en lecture
-    watched, acc2 = watcher_tick(set(), acc2)
-    assert watched == {"b"}
 
     print("self-check: OK")
 

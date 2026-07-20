@@ -17,8 +17,8 @@ if ! command -v brew >/dev/null 2>&1; then
 fi
 
 # --- 3. Outils CLI (obligatoires) ---
-echo "▶ dépendances CLI : yt-dlp, aria2, deno…"
-brew install yt-dlp aria2 deno
+echo "▶ dépendances CLI : yt-dlp, aria2, deno, ffmpeg…"
+brew install yt-dlp aria2 deno ffmpeg
 
 # --- 4. Applications (best-effort, ne bloque pas si l'utilisateur refuse) ---
 #   VLC     : lecture des vidéos

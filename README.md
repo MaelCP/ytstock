@@ -13,8 +13,10 @@ prérequis sont des outils système (`yt-dlp`, `aria2`, `deno`).
 - **Remplissage automatique** : le stock se recharge dès qu'il descend sous le budget.
 - **Classement par engagement** : likes/vues + commentaires/vues, indépendant de la
   taille de la chaîne — une petite vidéo très aimée passe devant un gros buzz tiède.
-- **Suppression après visionnage** : détection via `lsof` (VLC/IINA/QuickTime/mpv),
-  90 s de lecture = vue → supprimée, l'espace se recycle.
+- **Reprise + suppression quand finie** : les vidéos ne sont **jamais** supprimées
+  à la fermeture. VLC reprend au bon timecode (sa position de reprise), et une
+  vidéo n'est supprimée + rangée dans « Vues récemment » que lorsqu'elle est
+  **finie** (position VLC à ≤ 20 s de la fin, durée via `ffprobe`).
 - **👍 local** : liker une vidéo vue oriente les prochains téléchargements vers la
   **même chaîne** (rien n'est envoyé à YouTube, aucun compte modifié).
 - **Interface web** : coller une URL pour télécharger direct, relancer un cycle,
@@ -28,6 +30,9 @@ prérequis sont des outils système (`yt-dlp`, `aria2`, `deno`).
 - **Python 3.9+** (fourni avec macOS).
 - **Homebrew** — https://brew.sh
 - Un navigateur connecté à YouTube (Firefox par défaut) pour les cookies.
+- **VLC** comme lecteur : c'est sa position de reprise qui pilote « En cours » et
+  la suppression automatique (règle VLC sur « continuer la lecture » pour éviter
+  le pop-up de reprise). `ffmpeg`/`ffprobe` pour les durées.
 
 ## Installation
 
@@ -83,8 +88,9 @@ thèmes de recherche (`THEMES`), bonus des chaînes likées (`LIKED_BOOST`).
    likées, recherches thématiques) via `yt-dlp --flat-playlist` (rapide).
 2. `fetch_metadata` récupère like/vues/commentaires par lots et les classe.
 3. `download` télécharge en ≤720p via `aria2c` tant que le budget n'est pas atteint.
-4. Le démon surveille les fichiers ouverts : une vidéo regardée puis fermée est
-   marquée vue, supprimée, et son visionnage libère de la place pour la suivante.
+4. Le démon lit la position de reprise que VLC enregistre par fichier
+   (`org.videolan.vlc.plist`) : une vidéo commencée reste en stock (onglet
+   « En cours »), et n'est supprimée que quand sa position atteint la fin.
 
 Le tout est sérialisé par un verrou fichier (`flock`) : démon et interface ne
 téléchargent jamais le même fichier en même temps.
