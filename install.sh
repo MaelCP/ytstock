@@ -57,7 +57,10 @@ cat >> "$APP/Contents/MacOS/ytstock" <<'LAUNCH'
 STATE="$REPO/.ytstock"; mkdir -p "$STATE"
 exec >>"$STATE/app.log" 2>&1
 echo "--- lancement $(date)"
-PY="$(command -v python3 || echo /usr/bin/python3)"
+# python Homebrew d'abord : /usr/bin/python3 est un shim qui pointe vers Xcode
+for c in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+  [ -x "$c" ] && { PY="$c"; break; }
+done
 URL=http://127.0.0.1:8787
 
 pgrep -f "ytstock.py daemon" >/dev/null || { echo "démon"; "$PY" "$REPO/ytstock.py" daemon & }
@@ -90,4 +93,10 @@ cat <<DONE
    • Lance l'app : open -a ytstock   (ou double-clic sur ytstock dans Applications)
    • Ou en terminal : python3 "$REPO/ytstock.py" serve
    Les vidéos vont dans ~/Downloads/videos (change avec la variable YTSTOCK_DIR).
+
+⚠️  ACCÈS DISQUE (une seule fois) : si le dossier des vidéos est dans un
+    emplacement protégé (Downloads, Bureau, Documents), macOS bloque l'app.
+    Réglages Système ▸ Confidentialité et sécurité ▸ Accès complet au disque
+    ▸ + ▸ ajoute /Applications/ytstock.app, puis relance l'app.
+    (Astuce : mets YTSTOCK_DIR dans ~/Movies ou ~/ytstock pour éviter cette étape.)
 DONE

@@ -40,6 +40,18 @@ cd ytstock
 `install.sh` installe `yt-dlp`, `aria2`, `deno` (et propose VLC/Firefox/Chrome),
 puis construit `ytstock.app` dans `/Applications`. Relançable sans risque.
 
+### ⚠️ Accès disque (une seule fois)
+
+Si le dossier des vidéos est dans un emplacement protégé par macOS
+(`~/Downloads`, Bureau, Documents), l'app lancée depuis le Finder est bloquée
+(`Operation not permitted`). Autorise-la une fois :
+
+**Réglages Système ▸ Confidentialité et sécurité ▸ Accès complet au disque ▸ +**
+→ ajoute `/Applications/ytstock.app`, puis relance l'app.
+
+Pour éviter cette étape, place les vidéos hors zone protégée :
+`export YTSTOCK_DIR="$HOME/Movies/ytstock"`.
+
 ## Utilisation
 
 ```sh
