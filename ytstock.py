@@ -791,12 +791,12 @@ transform:translateX(-100%);transition:.2s;z-index:40;padding:18px;display:flex;
   <option value=360>360p</option>
   <option value=audio>Audio seul (m4a)</option>
  </select>
- <button class=mcyc id=cyc type=button>⟳ Relancer un cycle</button>
+ <button class=mcyc id=cyc type=button>Relancer un cycle</button>
  <h3>Naviguer</h3>
- <button class=nav data-v=encours>▶ En cours</button>
- <button class="nav on" data-v=stock>📥 Téléchargées</button>
- <button class=nav data-v=hist>👁 Vues récemment</button>
- <button class=nav data-v=cand>✨ Suggestions</button>
+ <button class=nav data-v=encours>En cours</button>
+ <button class="nav on" data-v=stock>Téléchargées</button>
+ <button class=nav data-v=hist>Vues récemment</button>
+ <button class=nav data-v=cand>Suggestions</button>
 </nav>
 <header><button class=burger id=burger title=Menu>☰</button><h1>🎬 ytstock</h1><div class=bar id=bar>…</div></header>
 <div class=err id=err hidden></div>
@@ -870,7 +870,7 @@ async function load(){
 function showMenu(v){document.getElementById('drawer').classList.toggle('show',v);document.getElementById('ovl').classList.toggle('show',v)}
 function selectView(v){document.querySelectorAll('section[data-view]').forEach(s=>s.hidden=s.dataset.view!=v);
  document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('on',n.dataset.v==v))}
-function setBusy(b){const c=document.getElementById('cyc');c.disabled=b;c.textContent=b?'⏳ Cycle en cours…':'⟳ Relancer un cycle'}
+function setBusy(b){const c=document.getElementById('cyc');c.disabled=b;c.textContent=b?'Cycle en cours…':'Relancer un cycle'}
 document.getElementById('burger').onclick=()=>showMenu(true);
 document.getElementById('ovl').onclick=()=>showMenu(false);
 document.querySelectorAll('.nav').forEach(n=>n.onclick=()=>{selectView(n.dataset.v);showMenu(false)});
