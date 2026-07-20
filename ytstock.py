@@ -21,8 +21,9 @@ LOG_FILE     = STATE_DIR / "ytstock.log"
 THUMBS_DIR   = STATE_DIR / "thumbs"          # miniatures locales (offline), 1 par id
 CANDIDATES_FILE = STATE_DIR / "candidates.json"   # cache des candidats classés
 FAILS_FILE   = STATE_DIR / "fails.json"      # compteur d'échecs de download par id
-HISTORY_FILE = STATE_DIR / "history.json"    # dernières vues : likables après suppression
-LIKES_FILE   = STATE_DIR / "likes.json"      # likes LOCAUX -> oriente les prochains dl
+HISTORY_FILE = STATE_DIR / "history.json"    # dernières vues : notables après suppression
+LIKES_FILE   = STATE_DIR / "likes.json"      # 👍 LOCAUX -> privilégie ces chaînes
+DISLIKES_FILE = STATE_DIR / "dislikes.json"  # 👎 LOCAUX -> évite ces chaînes
 
 BUDGET_BYTES = 15 * 1024**3
 MAX_HEIGHT   = 720
@@ -33,7 +34,7 @@ POLL_SECS    = 15
 HISTORY_SECS = 30 * 60
 THEMES       = ["philosophie", "ARTE", "psychologie", "documentaire", "NBA"]
 PLAYERS      = ["VLC", "IINA", "QuickTime", "mpv"]
-VIDEO_EXTS   = {".mp4", ".webm", ".mkv"}
+VIDEO_EXTS   = {".mp4", ".webm", ".mkv", ".m4a"}   # .m4a = téléchargements audio-only
 COOKIES_BROWSER = os.environ.get("YTSTOCK_COOKIES_BROWSER", "firefox")  # firefox = pas de prompt Trousseau (contrairement à chrome)
 METADATA_CHUNK  = 25              # nb de candidats dont on fetch les métadonnées par passe
 MIN_VIEWS       = 500             # plancher : sous ça le ratio d'engagement = bruit
@@ -146,13 +147,17 @@ def save_watch(d):
 
 # Task 5: Watcher state machine
 def watcher_tick(open_ids, acc):
-    new_acc = {}
-    watched = set()
+    """Accumule le temps de visionnage PAR vidéo, persistant entre ouvertures.
+    Une vidéo est 'vue' quand elle a cumulé WATCHED_SECS ET qu'elle est refermée
+    (jamais pendant la lecture). Un visionnage partiel reste dans acc -> 'en cours',
+    et le temps s'additionne à la reprise."""
+    new_acc = dict(acc)
     for vid in open_ids:
-        new_acc[vid] = acc.get(vid, 0) + POLL_SECS
-    for vid, secs in acc.items():
-        if vid not in open_ids and secs >= WATCHED_SECS:
-            watched.add(vid)
+        new_acc[vid] = new_acc.get(vid, 0) + POLL_SECS
+    watched = {vid for vid, secs in new_acc.items()
+               if vid not in open_ids and secs >= WATCHED_SECS}
+    for vid in watched:
+        new_acc.pop(vid, None)
     return watched, new_acc
 
 
@@ -243,14 +248,30 @@ def gather_candidates(limit_per_source):
     return out
 
 
+# Qualités proposées dans l'onglet "télécharger par URL" (façon convertisseur).
+# Clé -> arguments de sélection de format yt-dlp. "audio" = extraction m4a.
+QUALITIES = {
+    "max":   ["-f", "bv*+ba/b"],
+    "1080":  ["-f", "bv*[height<=1080]+ba/b[height<=1080]"],
+    "720":   ["-f", "bv*[height<=720]+ba/b[height<=720]"],
+    "480":   ["-f", "bv*[height<=480]+ba/b[height<=480]"],
+    "360":   ["-f", "bv*[height<=360]+ba/b[height<=360]"],
+    "audio": ["-f", "ba/b", "-x", "--audio-format", "m4a"],
+}
+
+
 # Task 8: Download via yt-dlp + aria2c
-def download(video_id):
+def download(video_id, quality=None):
+    """quality=None -> plafond démon (MAX_HEIGHT, pour le budget). Sinon un choix
+    utilisateur de QUALITIES (résolution ou audio)."""
     THUMBS_DIR.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(VIDEO_DIR / "%(title)s [%(id)s].%(ext)s")
     thumb_tmpl = "thumbnail:" + str(THUMBS_DIR / "%(id)s.%(ext)s")
+    fmt = QUALITIES.get(quality) or \
+        ["-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]"]
     cmd = [
         "yt-dlp",
-        "-f", f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]",
+        *fmt,
         "--external-downloader", "aria2c",
         "--external-downloader-args", "aria2c:-x16 -s16 -k1M",
         "--cookies-from-browser", COOKIES_BROWSER,
@@ -347,19 +368,31 @@ def load_likes():
     return _load_json(LIKES_FILE, {})
 
 
-def add_like(video_id, title):
-    """Like LOCAL : rien n'est envoyé à YouTube. Sert uniquement à orienter les
-    prochains téléchargements (voir liked_channels)."""
-    likes = load_likes()
-    if video_id in likes:
+def load_dislikes():
+    return _load_json(DISLIKES_FILE, {})
+
+
+# Notes LOCALES (👍/👎) : rien n'est envoyé à YouTube. Elles orientent seulement
+# les prochains téléchargements — like privilégie une chaîne, dislike l'évite.
+def _add_rating(path, video_id, title):
+    d = _load_json(path, {})
+    if video_id in d:
         return
-    likes[video_id] = {"title": title, "channel": None,
-                       "ts": datetime.datetime.now().isoformat(timespec="seconds")}
-    _atomic_write(LIKES_FILE, json.dumps(likes))
+    d[video_id] = {"title": title, "channel": None,
+                   "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+    _atomic_write(path, json.dumps(d))
 
 
-def resolve_like_channel(video_id):
-    """Récupère la chaîne d'une vidéo likée — le signal de similarité. Lent
+def add_like(video_id, title):
+    _add_rating(LIKES_FILE, video_id, title)
+
+
+def add_dislike(video_id, title):
+    _add_rating(DISLIKES_FILE, video_id, title)
+
+
+def _resolve_channel(path, video_id):
+    """Récupère la chaîne d'une vidéo notée — le signal de similarité. Lent
     (~5 s) donc appelé hors du chemin HTTP. Hors ligne -> None, réessayé au
     refill suivant."""
     cmd = ["yt-dlp", "--no-download", "--ignore-errors",
@@ -369,22 +402,26 @@ def resolve_like_channel(video_id):
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (subprocess.SubprocessError, OSError) as e:
-        log(f"resolve_like_channel error {video_id}: {e}")
+        log(f"resolve channel error {video_id}: {e}")
         return
     lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
     cid = lines[0] if lines else ""
     if not is_valid_channel(cid):
         return
-    likes = load_likes()
-    if video_id in likes:
-        likes[video_id]["channel"] = cid
-        _atomic_write(LIKES_FILE, json.dumps(likes))
-        log(f"like: {video_id} -> chaîne {cid}")
+    d = _load_json(path, {})
+    if video_id in d:
+        d[video_id]["channel"] = cid
+        _atomic_write(path, json.dumps(d))
+        log(f"note: {video_id} -> chaîne {cid}")
 
 
-def liked_channels():
-    """Chaînes likées, les plus récentes d'abord, dédupliquées."""
-    entries = sorted(load_likes().values(),
+def resolve_rating_channel(kind, video_id):
+    _resolve_channel(LIKES_FILE if kind == "like" else DISLIKES_FILE, video_id)
+
+
+def _rated_channels(path):
+    """Chaînes notées, les plus récentes d'abord, dédupliquées."""
+    entries = sorted(_load_json(path, {}).values(),
                      key=lambda l: l.get("ts") or "", reverse=True)
     out = []
     for e in entries:
@@ -396,11 +433,20 @@ def liked_channels():
     return out
 
 
-def backfill_like_channels():
-    """Résout les chaînes des likes faits hors ligne (best-effort)."""
-    for vid, e in load_likes().items():
-        if not e.get("channel"):
-            resolve_like_channel(vid)
+def liked_channels():
+    return _rated_channels(LIKES_FILE)
+
+
+def disliked_channels():
+    return _rated_channels(DISLIKES_FILE)
+
+
+def backfill_rating_channels():
+    """Résout les chaînes des notes faites hors ligne (best-effort)."""
+    for path in (LIKES_FILE, DISLIKES_FILE):
+        for vid, e in _load_json(path, {}).items():
+            if not e.get("channel"):
+                _resolve_channel(path, vid)
 
 
 def engagement_score(m):
@@ -429,7 +475,9 @@ def save_candidates(metas):
     """Écrit le top 50 (non vus, triés engagement) pour l'onglet 'à télécharger'."""
     seen = load_seen()
     liked = liked_channels()
-    ranked = sorted((m for m in metas if m["id"] not in seen),
+    disliked = disliked_channels()
+    ranked = sorted((m for m in metas
+                     if m["id"] not in seen and m.get("channel") not in disliked),
                     key=lambda m: ranked_score(m, liked), reverse=True)[:50]
     _atomic_write(CANDIDATES_FILE, json.dumps(ranked))
 
@@ -493,7 +541,7 @@ def refill():
 def _refill():
     seed_seen_from_disk()
     sweep_stale_partials()
-    backfill_like_channels()   # likes faits hors ligne : chaîne encore inconnue
+    backfill_rating_channels()   # notes faites hors ligne : chaîne encore inconnue
     log(f"refill: {dir_used_bytes() // 1024**2} MiB / {BUDGET_BYTES // 1024**2} MiB")
     # candidats en flat (rapide) -> métadonnées par chunks (coûteux) -> classement.
     pool = [c for c in gather_candidates(40) if is_wanted(c, load_seen())]
@@ -506,8 +554,10 @@ def _refill():
         i += METADATA_CHUNK
         seen = load_seen()
         liked = liked_channels()
+        disliked = disliked_channels()
         good = [m for m in fetch_metadata(chunk)
-                if is_wanted(m, seen) and enough_signal(m)]
+                if is_wanted(m, seen) and enough_signal(m)
+                and m.get("channel") not in disliked]
         good.sort(key=lambda m: ranked_score(m, liked), reverse=True)
         for m in good:
             if needs_more(dir_used_bytes()):
@@ -573,6 +623,10 @@ def daemon():
             did_delete = bool(watched)
             for vid in watched:
                 mark_watched(vid, "local")
+            # purge des vidéos disparues du disque (supprimées via l'UI, etc.),
+            # sinon acc accumule des 'en cours' fantômes.
+            on_disk = {id_from_name(p.name) for p in list_stock_files()}
+            acc = {v: s for v, s in acc.items() if v in on_disk}
             save_watch(acc)
 
             # ponytail: refill()/download() bloquent la boucle (donc la détection
@@ -640,13 +694,16 @@ def is_busy():
 
 def history_items():
     likes = load_likes()
+    dislikes = load_dislikes()
     return [{**h,
              "liked": h.get("id") in likes,
+             "disliked": h.get("id") in dislikes,
              "thumb": (THUMBS_DIR / f"{h.get('id')}.jpg").exists()}
             for h in load_history()]
 
 
 def stock_items():
+    acc = load_watch()   # temps de visionnage cumulé -> distingue "en cours"
     items = []
     for p in sorted(list_stock_files(), key=lambda x: x.stat().st_mtime, reverse=True):
         vid = id_from_name(p.name)
@@ -657,6 +714,7 @@ def stock_items():
             "title": title_from_name(p.name),
             "size_mib": p.stat().st_size // 1024**2,
             "thumb": (THUMBS_DIR / f"{vid}.jpg").exists(),
+            "watched_secs": int(acc.get(vid, 0)),   # >0 = commencée, non finie
         })
     return items
 
@@ -682,117 +740,149 @@ def backfill_thumbs():
 PAGE = """<!doctype html><html lang=fr><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>ytstock</title><style>
-*{box-sizing:border-box}body{margin:0;font:15px/1.4 -apple-system,system-ui,sans-serif;
-background:#111;color:#eee}header{position:sticky;top:0;background:#181818;
-padding:14px 20px;border-bottom:1px solid #2a2a2a;display:flex;gap:16px;align-items:center}
-h1{font-size:17px;margin:0;font-weight:600}.bar{color:#9a9a9a;font-size:13px}
-.bar b{color:#eee}main{padding:20px;max-width:1200px;margin:0 auto}
-.dlf{margin-left:auto;display:flex;gap:6px}
-.dlf input{background:#111;border:1px solid #333;border-radius:7px;color:#eee;
-padding:7px 10px;font-size:13px;width:250px}
-.dlf input:focus{outline:0;border-color:#2d6cdf}
-.go{background:#227a4b;flex:0 0 auto;font-size:15px;padding:6px 12px;line-height:1}
-.cyc{background:#333;flex:0 0 auto;font-size:16px;padding:6px 12px;line-height:1}
-.err{background:#4a1d1d;color:#f2b8b8;padding:10px 20px;font-size:13px;
-border-bottom:1px solid #6a2a2a}
-h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#8a8a8a;
-margin:26px 0 12px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
-gap:16px}.card{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden;
-display:flex;flex-direction:column}.thumb{aspect-ratio:16/9;background:#000;object-fit:cover;
-width:100%;display:block}.ph{aspect-ratio:16/9;background:linear-gradient(135deg,#242424,#161616);
-display:flex;align-items:center;justify-content:center;color:#444;font-size:32px}
+*{box-sizing:border-box}body{margin:0;font:15px/1.4 -apple-system,system-ui,sans-serif;background:#111;color:#eee}
+header{position:sticky;top:0;z-index:20;background:#181818;padding:12px 18px;border-bottom:1px solid #2a2a2a;display:flex;gap:14px;align-items:center}
+h1{font-size:17px;margin:0;font-weight:600}
+.burger{background:none;border:0;color:#eee;font-size:22px;cursor:pointer;padding:2px 6px;line-height:1;flex:0 0 auto}
+.bar{color:#9a9a9a;font-size:13px;margin-left:auto}.bar b{color:#eee}
+main{padding:20px;max-width:1200px;margin:0 auto}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#8a8a8a;margin:0 0 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:16px}
+.card{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+.thumb{aspect-ratio:16/9;background:#000;object-fit:cover;width:100%;display:block}
+.ph{aspect-ratio:16/9;background:linear-gradient(135deg,#242424,#161616);display:flex;align-items:center;justify-content:center;color:#444;font-size:32px}
 .body{padding:10px 12px;flex:1;display:flex;flex-direction:column;gap:8px}
 .t{font-size:13px;font-weight:500;line-height:1.35;max-height:3.4em;overflow:hidden}
 .meta{font-size:12px;color:#8a8a8a}.row{display:flex;gap:8px;margin-top:auto}
-button{flex:1;border:0;border-radius:7px;padding:8px;font-size:13px;font-weight:600;
-cursor:pointer;color:#fff}.play{background:#2d6cdf}
-.del{background:#3a2020;color:#e88;flex:0 0 auto;font-size:15px;padding:6px 12px;line-height:1}
-.dl{background:#227a4b;flex:0 0 auto;font-size:16px;padding:6px 12px;line-height:1}
-.lk{background:#2a2a2a;font-size:15px;padding:6px 12px;line-height:1}
-.lk.on{background:#1f4d33;color:#8fe0b0}
-button:disabled{opacity:.4;cursor:not-allowed}
+button{font-family:inherit;border:0;cursor:pointer}
+.act{flex:1;border-radius:7px;padding:8px;font-size:13px;font-weight:600;color:#fff}
+.play{background:#2d6cdf}.resume{background:#7a4a12}
+.del{background:#3a2020;color:#e88;border-radius:7px;font-size:15px;padding:6px 12px;line-height:1;flex:0 0 auto}
+.dl{background:#227a4b;color:#fff;border-radius:7px;font-size:16px;padding:6px 12px;line-height:1;flex:0 0 auto}
+.lk,.dk{background:#2a2a2a;color:#eee;border-radius:7px;font-size:15px;padding:6px 12px;line-height:1}
+.lk.on{background:#1f4d33;color:#8fe0b0}.dk.on{background:#4d1f1f;color:#e08f8f}
+button:disabled{opacity:.45;cursor:not-allowed}
 .empty{color:#666;padding:20px 0}.off{color:#c96;font-size:12px}
+.ovl{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:.2s;z-index:30}
+.ovl.show{opacity:1;pointer-events:auto}
+.drawer{position:fixed;top:0;left:0;bottom:0;width:270px;background:#1a1a1a;border-right:1px solid #2a2a2a;
+transform:translateX(-100%);transition:.2s;z-index:40;padding:18px;display:flex;flex-direction:column;gap:8px;overflow:auto}
+.drawer.show{transform:none}
+.drawer h3{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#777;margin:14px 0 4px}
+.nav{background:none;color:#ddd;text-align:left;padding:10px 12px;border-radius:8px;font-size:14px;width:100%}
+.nav:hover{background:#242424}.nav.on{background:#2d6cdf;color:#fff;font-weight:600}
+.dlf{display:flex;gap:6px}
+.dlf input{flex:1;background:#111;border:1px solid #333;border-radius:7px;color:#eee;padding:8px 10px;font-size:13px;min-width:0}
+.dlf input:focus{outline:0;border-color:#2d6cdf}
+.qsel{background:#111;border:1px solid #333;border-radius:7px;color:#eee;padding:8px 10px;font-size:13px;width:100%}
+.mgo{background:#227a4b;border-radius:7px;color:#fff;font-size:15px;padding:0 12px;flex:0 0 auto}
+.mcyc{background:#333;border-radius:8px;color:#fff;font-size:14px;padding:10px;width:100%;font-weight:600}
+.err{background:#4a1d1d;color:#f2b8b8;padding:10px 20px;font-size:13px;border-bottom:1px solid #6a2a2a}
 </style></head><body>
-<header><h1>🎬 ytstock</h1><div class=bar id=bar>…</div>
-<form class=dlf id=dlf><input id=url placeholder="Coller une URL YouTube…" autocomplete=off>
-<button class=go type=submit title="Télécharger cette URL">⬇</button>
-<button class=cyc id=cyc type=button title="Relancer un cycle de téléchargement">⟳</button>
-</form></header>
+<div class=ovl id=ovl></div>
+<nav class=drawer id=drawer>
+ <h3>Télécharger par lien</h3>
+ <form class=dlf id=dlf><input id=url placeholder="Lien YouTube…" autocomplete=off><button class=mgo type=submit title=Télécharger>⬇</button></form>
+ <select id=q class=qsel>
+  <option value=max>Qualité max</option>
+  <option value=1080>1080p</option>
+  <option value=720 selected>720p</option>
+  <option value=480>480p</option>
+  <option value=360>360p</option>
+  <option value=audio>Audio seul (m4a)</option>
+ </select>
+ <button class=mcyc id=cyc type=button>⟳ Relancer un cycle</button>
+ <h3>Naviguer</h3>
+ <button class=nav data-v=encours>▶ En cours</button>
+ <button class="nav on" data-v=stock>📥 Téléchargées</button>
+ <button class=nav data-v=hist>👁 Vues récemment</button>
+ <button class=nav data-v=cand>✨ Suggestions</button>
+</nav>
+<header><button class=burger id=burger title=Menu>☰</button><h1>🎬 ytstock</h1><div class=bar id=bar>…</div></header>
 <div class=err id=err hidden></div>
 <main>
-<h2>En stock — à regarder</h2><div class=grid id=stock></div>
-<h2>Vues récemment — 👍 pour en télécharger des similaires</h2><div class=grid id=hist></div>
-<h2>À télécharger — les plus engageantes <span class=off id=offnote></span></h2>
-<div class=grid id=cand></div>
+ <section data-view=encours hidden><h2>En cours — reprendre là où tu t'es arrêté</h2><div class=grid id=g-encours></div></section>
+ <section data-view=stock><h2>Téléchargées — à regarder</h2><div class=grid id=g-stock></div></section>
+ <section data-view=hist hidden><h2>Vues récemment — 👍 des similaires · 👎 éviter la chaîne</h2><div class=grid id=g-hist></div></section>
+ <section data-view=cand hidden><h2>Suggestions — à télécharger <span class=off id=offnote></span></h2><div class=grid id=g-cand></div></section>
 </main>
 <script>
-const online = navigator.onLine;
+const online=navigator.onLine;
 async function j(u,o){const r=await fetch(u,o);return r.json()}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function card(html){const d=document.createElement('div');d.className='card';d.innerHTML=html;return d}
-function thumbStock(it){return it.thumb?`<img class=thumb src="/thumb/${it.id}">`:`<div class=ph>🎬</div>`}
+function thumbLocal(it){return it.thumb?`<img class=thumb src="/thumb/${it.id}">`:`<div class=ph>🎬</div>`}
 function fail(m){const e=document.getElementById('err');e.textContent=m;e.hidden=false}
 function ok(){document.getElementById('err').hidden=true}
-// un serveur arrêté ne doit plus ressembler à un bouton cassé : on distingue
-// panne réseau, statut HTTP et refus applicatif, et on l'affiche.
-async function post(u){
- let r;
- try{r=await fetch(u,{method:'POST'})}
- catch(e){fail('Serveur injoignable — relance : python3 ytstock.py serve');return {ok:false}}
+function fmt(s){return s<60?s+' s':Math.round(s/60)+' min'}
+// serveur arrêté != bouton cassé : on distingue panne réseau, statut HTTP, refus applicatif.
+async function post(u){let r;
+ try{r=await fetch(u,{method:'POST'})}catch(e){fail('Serveur injoignable — relance : python3 ytstock.py serve');return {ok:false}}
  if(!r.ok){fail('Erreur serveur ('+r.status+')');return {ok:false}}
  ok();return r.json()}
-async function load(){
- const st=await j('/api/stock');
- const el=document.getElementById('stock');el.innerHTML='';
- let mib=0;
- st.forEach(it=>{mib+=it.size_mib;
-  const c=card(`${thumbStock(it)}<div class=body><div class=t>${esc(it.title)}</div>
-   <div class=meta>${it.size_mib} Mo</div>
-   <div class=row><button class=play>▶ Lancer</button><button class=del title=Supprimer>✕</button></div></div>`);
-  c.querySelector('.play').onclick=async e=>{e.target.textContent='…';await post('/api/open?id='+it.id);e.target.textContent='▶ Lancer'};
-  c.querySelector('.del').onclick=async()=>{if(confirm('Supprimer « '+it.title+' » ?')){await post('/api/delete?id='+it.id);load()}};
-  el.appendChild(c)});
- if(!st.length)el.innerHTML='<div class=empty>Rien en stock pour l\\'instant.</div>';
- document.getElementById('bar').innerHTML=`<b>${st.length}</b> vidéos · <b>${(mib/1024).toFixed(1)}</b> Go`;
- const hs=await j('/api/history');
- const he=document.getElementById('hist');he.innerHTML='';
- hs.forEach(it=>{
-  const c=card(`${thumbStock(it)}<div class=body><div class=t>${esc(it.title)}</div>
-   <div class=row><button class="lk${it.liked?' on':''}" title="J'aime — l'app en cherchera des similaires"
-   ${it.liked?'disabled':''}>${it.liked?'👍 ✓':'👍'}</button></div></div>`);
-  const b=c.querySelector('.lk');
-  if(!it.liked)b.onclick=async()=>{b.disabled=true;const r=await post('/api/like?id='+it.id);
-   if(r.ok){b.textContent='👍 ✓';b.classList.add('on')}else{b.disabled=false}};
-  he.appendChild(c)});
- if(!hs.length)he.innerHTML='<div class=empty>Aucune vidéo vue pour l\\'instant.</div>';
- const cd=await j('/api/candidates');
- const ce=document.getElementById('cand');ce.innerHTML='';
- document.getElementById('offnote').textContent=online?'':'(hors ligne — téléchargement indispo)';
- cd.forEach(m=>{
-  const c=card(`<img class=thumb src="https://i.ytimg.com/vi/${m.id}/mqdefault.jpg" onerror="this.outerHTML='<div class=ph>🎬</div>'">
-   <div class=body><div class=t>${esc(m.title||m.id)}</div>
-   <div class=meta>❤ ${m.like} · 💬 ${m.comment} · 👁 ${m.view}</div>
-   <div class=row><button class=dl title="Télécharger" ${online?'':'disabled'}>⬇</button></div></div>`);
-  const b=c.querySelector('.dl');
-  if(online)b.onclick=async()=>{b.textContent='téléchargement…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent=r.busy?'⏳':'✕';setTimeout(()=>{b.textContent='⬇';b.disabled=false},2500)}};
-  ce.appendChild(c)});
- if(!cd.length)ce.innerHTML='<div class=empty>Pas encore de candidats (lance un refill en ligne).</div>';
+function delBtn(it){const b=document.createElement('button');b.className='del';b.title='Supprimer';b.textContent='✕';
+ b.onclick=async()=>{if(confirm('Supprimer « '+it.title+' » ?')){await post('/api/delete?id='+it.id);load()}};return b}
+function playBtn(it,resume){const b=document.createElement('button');b.className='act '+(resume?'resume':'play');
+ b.textContent=resume?'▶ Reprendre':'▶ Lancer';
+ b.onclick=async()=>{const t=b.textContent;b.textContent='…';await post('/api/open?id='+it.id);b.textContent=t};return b}
+function rateBtn(it,kind){const on=kind=='like'?it.liked:it.disliked, other=kind=='like'?it.disliked:it.liked;
+ const b=document.createElement('button');b.className=(kind=='like'?'lk':'dk')+(on?' on':'');
+ b.textContent=(kind=='like'?'👍':'👎')+(on?' ✓':'');
+ b.title=kind=='like'?"J'aime — l'app cherchera des similaires":"Pas pour moi — l'app évitera cette chaîne";
+ if(on||other)b.disabled=true;
+ else b.onclick=async()=>{b.disabled=true;const r=await post('/api/'+kind+'?id='+it.id);if(r.ok){load()}else b.disabled=false};
+ return b}
+function renderStock(st){
+ const enc=st.filter(it=>it.watched_secs>0), fresh=st.filter(it=>!it.watched_secs);
+ const ge=document.getElementById('g-encours');ge.innerHTML='';
+ enc.forEach(it=>{const c=card(`${thumbLocal(it)}<div class=body><div class=t>${esc(it.title)}</div>
+   <div class=meta>⏱ ${fmt(it.watched_secs)} déjà vues · ${it.size_mib} Mo</div><div class=row></div></div>`);
+  c.querySelector('.row').append(playBtn(it,true),delBtn(it));ge.appendChild(c)});
+ if(!enc.length)ge.innerHTML='<div class=empty>Aucune vidéo en cours.</div>';
+ const gs=document.getElementById('g-stock');gs.innerHTML='';
+ fresh.forEach(it=>{const c=card(`${thumbLocal(it)}<div class=body><div class=t>${esc(it.title)}</div>
+   <div class=meta>${it.size_mib} Mo</div><div class=row></div></div>`);
+  c.querySelector('.row').append(playBtn(it,false),delBtn(it));gs.appendChild(c)});
+ if(!fresh.length)gs.innerHTML='<div class=empty>Rien de neuf en stock.</div>';
 }
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function setBusy(b){const c=document.getElementById('cyc');c.disabled=b;c.textContent=b?'⏳':'⟳'}
-document.getElementById('cyc').onclick=async()=>{
- const r=await post('/api/refill');
- if(r.busy)fail('Un cycle est déjà en cours.');else if(r.ok)setBusy(true)};
-document.getElementById('dlf').onsubmit=async e=>{
- e.preventDefault();
+function renderHist(hs){const gh=document.getElementById('g-hist');gh.innerHTML='';
+ hs.forEach(it=>{const c=card(`${thumbLocal(it)}<div class=body><div class=t>${esc(it.title)}</div><div class=row></div></div>`);
+  c.querySelector('.row').append(rateBtn(it,'like'),rateBtn(it,'dislike'));gh.appendChild(c)});
+ if(!hs.length)gh.innerHTML='<div class=empty>Aucune vidéo vue pour l\\'instant.</div>';
+}
+function renderCand(cd){const gc=document.getElementById('g-cand');gc.innerHTML='';
+ document.getElementById('offnote').textContent=online?'':'(hors ligne — indispo)';
+ cd.forEach(m=>{const c=card(`<img class=thumb src="https://i.ytimg.com/vi/${m.id}/mqdefault.jpg" onerror="this.outerHTML='<div class=ph>🎬</div>'">
+   <div class=body><div class=t>${esc(m.title||m.id)}</div><div class=meta>❤ ${m.like} · 💬 ${m.comment} · 👁 ${m.view}</div>
+   <div class=row><button class=dl title=Télécharger ${online?'':'disabled'}>⬇</button></div></div>`);
+  const b=c.querySelector('.dl');
+  if(online)b.onclick=async()=>{b.textContent='…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent=r.busy?'⏳':'✕';setTimeout(()=>{b.textContent='⬇';b.disabled=false},2500)}};
+  gc.appendChild(c)});
+ if(!cd.length)gc.innerHTML='<div class=empty>Pas encore de suggestions (lance un cycle en ligne).</div>';
+}
+async function load(){
+ const st=await j('/api/stock');renderStock(st);
+ const mib=st.reduce((a,b)=>a+b.size_mib,0);
+ document.getElementById('bar').innerHTML=`<b>${st.length}</b> vidéos · <b>${(mib/1024).toFixed(1)}</b> Go`;
+ renderHist(await j('/api/history'));
+ renderCand(await j('/api/candidates'));
+}
+function showMenu(v){document.getElementById('drawer').classList.toggle('show',v);document.getElementById('ovl').classList.toggle('show',v)}
+function selectView(v){document.querySelectorAll('section[data-view]').forEach(s=>s.hidden=s.dataset.view!=v);
+ document.querySelectorAll('.nav').forEach(n=>n.classList.toggle('on',n.dataset.v==v))}
+function setBusy(b){const c=document.getElementById('cyc');c.disabled=b;c.textContent=b?'⏳ Cycle en cours…':'⟳ Relancer un cycle'}
+document.getElementById('burger').onclick=()=>showMenu(true);
+document.getElementById('ovl').onclick=()=>showMenu(false);
+document.querySelectorAll('.nav').forEach(n=>n.onclick=()=>{selectView(n.dataset.v);showMenu(false)});
+document.getElementById('cyc').onclick=async()=>{const r=await post('/api/refill');if(r.busy)fail('Un cycle est déjà en cours.');else if(r.ok){setBusy(true);showMenu(false)}};
+document.getElementById('dlf').onsubmit=async e=>{e.preventDefault();
  const u=document.getElementById('url');if(!u.value.trim())return;
- const b=e.target.querySelector('.go');b.disabled=true;b.textContent='…';
- const r=await post('/api/download?url='+encodeURIComponent(u.value));
- b.disabled=false;b.textContent='⬇';
- if(r.ok){u.value='';load()}
- else fail(r.busy?'Occupé — un téléchargement est déjà en cours.'
-                :'Échec : URL invalide ou vidéo indisponible.')};
-// sonde légère : le refill dure des minutes, c'est le seul retour honnête sans
-// réécrire refill() en machine à états.
+ const b=e.target.querySelector('.mgo');b.disabled=true;b.textContent='…';
+ const q=document.getElementById('q').value;
+ const r=await post('/api/download?q='+q+'&url='+encodeURIComponent(u.value));b.disabled=false;b.textContent='⬇';
+ if(r.ok){u.value='';selectView('stock');showMenu(false);load()}
+ else fail(r.busy?'Occupé — un téléchargement est déjà en cours.':'Échec : URL invalide ou vidéo indisponible.')};
+// sonde légère : le refill dure des minutes, seul retour honnête sans machine à états.
 setInterval(async()=>{try{setBusy((await j('/api/busy')).busy)}catch(e){}},3000);
 load();
 </script></body></html>"""
@@ -875,20 +965,25 @@ def serve():
             elif path == "/api/delete":
                 mark_watched(vid, "ui")
                 self._json({"ok": True})
-            elif path == "/api/like":
+            elif path in ("/api/like", "/api/dislike"):
+                kind = "like" if path == "/api/like" else "dislike"
                 # titre pris dans l'historique, jamais du client
                 title = next((h["title"] for h in load_history()
                               if h.get("id") == vid), vid)
-                add_like(vid, title)
+                (add_like if kind == "like" else add_dislike)(vid, title)
                 # résolution de la chaîne hors du chemin HTTP (~5 s)
-                threading.Thread(target=resolve_like_channel, args=(vid,),
+                threading.Thread(target=resolve_rating_channel, args=(kind, vid),
                                  daemon=True).start()
                 self._json({"ok": True})
             elif path == "/api/download":
+                # qualité choisie côté UI, validée contre la liste blanche
+                quality = (q.get("q") or [""])[0]
+                if quality not in QUALITIES:
+                    quality = None                    # défaut = plafond démon
                 with download_lock() as got:
                     if not got:                       # démon en train de télécharger
                         return self._json({"ok": False, "busy": True})
-                    ok = download(vid)
+                    ok = download(vid, quality)
                     if ok:
                         add_seen(vid)
                         clear_fail(vid)
@@ -979,14 +1074,15 @@ def run_self_check():
 
     # Task 4 & 6: Persistent state and mark_watched (nested in temp dir)
     global STATE_DIR, SEEN_FILE, WATCH_FILE, VIDEO_DIR, FAILS_FILE
-    global HISTORY_FILE, LIKES_FILE
+    global HISTORY_FILE, LIKES_FILE, DISLIKES_FILE
     _saved_state = (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE,
-                    HISTORY_FILE, LIKES_FILE)
+                    HISTORY_FILE, LIKES_FILE, DISLIKES_FILE)
     _saved_vd = VIDEO_DIR
     _tmp = Path(tempfile.mkdtemp())
     STATE_DIR, SEEN_FILE, WATCH_FILE = _tmp, _tmp / "seen.txt", _tmp / "watch.json"
     FAILS_FILE = _tmp / "fails.json"
     HISTORY_FILE, LIKES_FILE = _tmp / "history.json", _tmp / "likes.json"
+    DISLIKES_FILE = _tmp / "dislikes.json"
     VIDEO_DIR = _tmp
     try:
         ensure_state_dir()
@@ -1049,27 +1145,46 @@ def run_self_check():
         likes["jjjjjjjjjjj"]["channel"] = "UC" + "a" * 22
         _atomic_write(LIKES_FILE, json.dumps(likes))
         assert liked_channels() == ["UC" + "a" * 22]
+
+        # dislikes : symétriques, servent à ÉVITER une chaîne
+        add_dislike("kkkkkkkkkkk", "Pas pour moi")
+        add_dislike("kkkkkkkkkkk", "Pas pour moi")   # idempotent
+        assert list(load_dislikes()) == ["kkkkkkkkkkk"]
+        assert disliked_channels() == []
+        dk = load_dislikes()
+        dk["kkkkkkkkkkk"]["channel"] = "UC" + "c" * 22
+        _atomic_write(DISLIKES_FILE, json.dumps(dk))
+        assert disliked_channels() == ["UC" + "c" * 22]
+        # un candidat d'une chaîne dislikée est écarté du classement
+        save_candidates([{"id": "lllllllllll", "title": "x", "like": 9, "comment": 9,
+                          "view": 9999, "channel": "UC" + "c" * 22}])
+        assert load_candidates() == []               # filtré (chaîne évitée)
     finally:
         (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE,
-         HISTORY_FILE, LIKES_FILE) = _saved_state
+         HISTORY_FILE, LIKES_FILE, DISLIKES_FILE) = _saved_state
         VIDEO_DIR = _saved_vd
         shutil.rmtree(_tmp, ignore_errors=True)
 
-    # Task 5: watcher_tick
-    # opening progressively
+    # Task 5: watcher_tick — le temps s'accumule et PERSISTE (visionnage partiel)
+    # ouverture progressive
     watched, acc = watcher_tick({"a"}, {})
     assert watched == set() and acc == {"a": POLL_SECS}
-    # continue until threshold (POLL_SECS=15 → 6 ticks = 90s)
-    for _ in range(5):
+    for _ in range(5):                          # 6 ticks * 15s = 90s
         watched, acc = watcher_tick({"a"}, acc)
     assert acc["a"] >= WATCHED_SECS and watched == set()
-    # close after threshold reached => watched
+    # fermée après le seuil => vue, oubliée
     watched, acc = watcher_tick(set(), acc)
     assert watched == {"a"} and "a" not in acc
-    # close before threshold => not watched, forgotten
-    _, acc2 = watcher_tick({"b"}, {})           # b at 15s only
+    # partiel puis fermée => PAS vue mais CONSERVÉE ("en cours")
+    _, acc2 = watcher_tick({"b"}, {})           # b à 15s
+    watched, acc2 = watcher_tick(set(), acc2)   # fermée avant seuil
+    assert watched == set() and acc2.get("b") == POLL_SECS
+    # reprise plus tard : le temps s'additionne jusqu'au seuil puis vue à la fermeture
+    for _ in range(6):
+        watched, acc2 = watcher_tick({"b"}, acc2)
+    assert watched == set() and acc2["b"] >= WATCHED_SECS   # pas supprimée en lecture
     watched, acc2 = watcher_tick(set(), acc2)
-    assert watched == set() and "b" not in acc2
+    assert watched == {"b"}
 
     print("self-check: OK")
 
