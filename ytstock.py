@@ -148,13 +148,27 @@ def _id_from_mrl(mrl):
     return id_from_name(Path(path).name)
 
 
-def vlc_positions():
-    """{id: secondes} des positions de reprise sauvegardées par VLC. Vide si VLC
-    n'a jamais tourné. Ne lève jamais : un plist absent/corrompu -> {}."""
+def _read_vlc_prefs():
+    """Préférences VLC, fraîches. Lit via cfprefsd (`defaults export`) car le
+    fichier .plist sur disque est en retard tant que VLC n'a pas flushé/quitté.
+    Repli sur la lecture directe si `defaults` échoue."""
     try:
-        d = plistlib.loads(VLC_PLIST.read_bytes())
+        out = subprocess.run(["defaults", "export", "org.videolan.vlc", "-"],
+                             capture_output=True, timeout=10)
+        if out.returncode == 0 and out.stdout:
+            return plistlib.loads(out.stdout)
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    try:
+        return plistlib.loads(VLC_PLIST.read_bytes())
     except (OSError, ValueError, plistlib.InvalidFileException):
         return {}
+
+
+def vlc_positions():
+    """{id: secondes} des positions de reprise sauvegardées par VLC. Vide si VLC
+    n'a jamais tourné. Ne lève jamais."""
+    d = _read_vlc_prefs()
     out = {}
     for mrl, pos in (d.get("recentlyPlayedMedia") or {}).items():
         vid = _id_from_mrl(mrl)
