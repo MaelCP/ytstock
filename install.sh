@@ -90,6 +90,29 @@ LAUNCH
 chmod +x "$APP/Contents/MacOS/ytstock"
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
 
+# --- 5b. App barre de menu (téléchargement rapide par lien copié) ---
+if command -v swiftc >/dev/null 2>&1 && [ -f "$REPO/menubar/ytstock-menu.swift" ]; then
+  echo "▶ build ytstock-menu.app (barre de menu)"
+  MAPP="/Applications/ytstock-menu.app"
+  swiftc -O -o "$REPO/menubar/ytstock-menu" "$REPO/menubar/ytstock-menu.swift" 2>/dev/null
+  rm -rf "$MAPP"; mkdir -p "$MAPP/Contents/MacOS" "$MAPP/Contents/Resources"
+  cp "$REPO/menubar/ytstock-menu" "$MAPP/Contents/MacOS/ytstock-menu"
+  [ -f "$REPO/assets/ytstock.icns" ] && cp "$REPO/assets/ytstock.icns" "$MAPP/Contents/Resources/ytstock.icns"
+  cat > "$MAPP/Contents/Info.plist" <<'MPL'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>ytstock-menu</string>
+<key>CFBundleIdentifier</key><string>local.ytstock.menu</string>
+<key>CFBundleExecutable</key><string>ytstock-menu</string>
+<key>CFBundleIconFile</key><string>ytstock</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSUIElement</key><true/>
+</dict></plist>
+MPL
+  codesign --force --deep --sign - "$MAPP" 2>/dev/null || true
+fi
+
 # --- 6. Vérification ---
 echo "▶ self-check"
 python3 "$REPO/ytstock.py" --self-check

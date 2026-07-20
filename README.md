@@ -22,6 +22,9 @@ prérequis sont des outils système (`yt-dlp`, `aria2`, `deno`).
 - **Interface web** : coller une URL pour télécharger direct, relancer un cycle,
   gérer le stock. Marche hors ligne pour tout ce qui est déjà téléchargé.
 - **Application macOS** : un clic lance démon + serveur + fenêtre dédiée.
+- **Barre de menu** : un « Y » en haut de l'écran (`ytstock-menu.app`). Copie un
+  lien YouTube, clique, il l'envoie à l'app pour téléchargement (avec choix de
+  qualité) — sans ouvrir la fenêtre. Client léger qui réutilise le serveur.
 
 ## Prérequis
 

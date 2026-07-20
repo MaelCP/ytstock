@@ -9,3 +9,4 @@
 # État runtime local
 .ytstock/
 __pycache__/
+menubar/ytstock-menu
