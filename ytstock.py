@@ -824,7 +824,8 @@ function delBtn(it){const b=document.createElement('button');b.className='del';b
  b.onclick=async()=>{if(confirm('Supprimer « '+it.title+' » ?')){await post('/api/delete?id='+it.id);load()}};return b}
 function playBtn(it,resume){const b=document.createElement('button');b.className='act '+(resume?'resume':'play');
  b.textContent=resume?'▶ Reprendre':'▶ Lancer';
- b.onclick=async()=>{const t=b.textContent;b.textContent='…';await post('/api/open?id='+it.id);b.textContent=t};return b}
+ b.onclick=async()=>{const t=b.textContent;b.textContent='…';const r=await post('/api/open?id='+it.id);
+  if(r.ok){b.textContent=t}else{ok();load()}};return b}   // disparue (vue entre-temps) -> recharge
 function rateBtn(it,kind){const on=kind=='like'?it.liked:it.disliked, other=kind=='like'?it.disliked:it.liked;
  const b=document.createElement('button');b.className=(kind=='like'?'lk':'dk')+(on?' on':'');
  b.textContent=(kind=='like'?'👍':'👎')+(on?' ✓':'');
@@ -884,6 +885,10 @@ document.getElementById('dlf').onsubmit=async e=>{e.preventDefault();
  else fail(r.busy?'Occupé — un téléchargement est déjà en cours.':'Échec : URL invalide ou vidéo indisponible.')};
 // sonde légère : le refill dure des minutes, seul retour honnête sans machine à états.
 setInterval(async()=>{try{setBusy((await j('/api/busy')).busy)}catch(e){}},3000);
+// rafraîchit les cartes : le démon déplace les vidéos vues (En cours -> Vues
+// récemment) sans que la page le sache. On ne recharge PAS pendant qu'un menu
+// est ouvert pour ne pas casser une interaction.
+setInterval(()=>{if(!document.getElementById('drawer').classList.contains('show'))load()},15000);
 load();
 </script></body></html>"""
 
