@@ -759,7 +759,8 @@ def stock_items():
             "title": title_from_name(p.name),
             "size_mib": p.stat().st_size // 1024**2,
             "thumb": (THUMBS_DIR / f"{vid}.jpg").exists(),
-            "resume_secs": int(pos.get(vid, 0)),   # >0 = en cours, reprend ici
+            "resume_secs": int(pos.get(vid, 0)),   # position de reprise
+            "started": vid in pos,   # dans les récents VLC = commencée -> "en cours"
         })
     return items
 
@@ -879,10 +880,10 @@ function rateBtn(it,kind){const on=kind=='like'?it.liked:it.disliked, other=kind
  else b.onclick=async()=>{b.disabled=true;const r=await post('/api/'+kind+'?id='+it.id);if(r.ok){load()}else b.disabled=false};
  return b}
 function renderStock(st){
- const enc=st.filter(it=>it.resume_secs>0), fresh=st.filter(it=>!it.resume_secs);
+ const enc=st.filter(it=>it.started), fresh=st.filter(it=>!it.started);
  const ge=document.getElementById('g-encours');ge.innerHTML='';
  enc.forEach(it=>{const c=card(`${thumbLocal(it)}<div class=body><div class=t>${esc(it.title)}</div>
-   <div class=meta>⏱ reprendre à ${mmss(it.resume_secs)} · ${it.size_mib} Mo</div><div class=row></div></div>`);
+   <div class=meta>${it.resume_secs>0?'⏱ reprendre à '+mmss(it.resume_secs):'à peine commencée'} · ${it.size_mib} Mo</div><div class=row></div></div>`);
   c.querySelector('.row').append(playBtn(it,true),delBtn(it));ge.appendChild(c)});
  if(!enc.length)ge.innerHTML='<div class=empty>Aucune vidéo en cours.</div>';
  const gs=document.getElementById('g-stock');gs.innerHTML='';
