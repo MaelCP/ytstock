@@ -13,7 +13,7 @@ import time
 import fcntl
 import contextlib
 
-VIDEO_DIR    = Path.home() / "Downloads" / "videos"
+VIDEO_DIR    = Path(os.environ.get("YTSTOCK_DIR", str(Path.home() / "Downloads" / "videos")))
 STATE_DIR    = VIDEO_DIR / ".ytstock"
 SEEN_FILE    = STATE_DIR / "seen.txt"
 WATCH_FILE   = STATE_DIR / "watch.json"
@@ -21,6 +21,8 @@ LOG_FILE     = STATE_DIR / "ytstock.log"
 THUMBS_DIR   = STATE_DIR / "thumbs"          # miniatures locales (offline), 1 par id
 CANDIDATES_FILE = STATE_DIR / "candidates.json"   # cache des candidats classés
 FAILS_FILE   = STATE_DIR / "fails.json"      # compteur d'échecs de download par id
+HISTORY_FILE = STATE_DIR / "history.json"    # dernières vues : likables après suppression
+LIKES_FILE   = STATE_DIR / "likes.json"      # likes LOCAUX -> oriente les prochains dl
 
 BUDGET_BYTES = 15 * 1024**3
 MAX_HEIGHT   = 720
@@ -32,11 +34,14 @@ HISTORY_SECS = 30 * 60
 THEMES       = ["philosophie", "ARTE", "psychologie", "documentaire", "NBA"]
 PLAYERS      = ["VLC", "IINA", "QuickTime", "mpv"]
 VIDEO_EXTS   = {".mp4", ".webm", ".mkv"}
-COOKIES_BROWSER = "firefox"       # firefox = pas de prompt Trousseau (contrairement à chrome)
+COOKIES_BROWSER = os.environ.get("YTSTOCK_COOKIES_BROWSER", "firefox")  # firefox = pas de prompt Trousseau (contrairement à chrome)
 METADATA_CHUNK  = 25              # nb de candidats dont on fetch les métadonnées par passe
 MIN_VIEWS       = 500             # plancher : sous ça le ratio d'engagement = bruit
 MIN_LIKES       = 20             # idem
 SERVE_PORT      = 8787            # interface web locale
+HISTORY_MAX     = 30              # nb de vidéos vues gardées en historique
+LIKED_BOOST     = 1.6             # bonus de score pour une chaîne likée — à régler à l'usage
+LIKED_CHANNELS_MAX = 10           # nb de chaînes likées utilisées comme sources
 
 
 # Task 1: ID extraction
@@ -120,13 +125,19 @@ def add_seen(video_id):
         f.write(video_id + "\n")
 
 
-def load_watch():
-    if not WATCH_FILE.exists():
-        return {}
+def _load_json(path, default):
+    """Lecture tolérante d'un fichier d'état : absent ou corrompu -> valeur par
+    défaut. Un état abîmé ne doit jamais tuer le démon."""
+    if not path.exists():
+        return default
     try:
-        return json.loads(WATCH_FILE.read_text())
+        return json.loads(path.read_text())
     except (ValueError, OSError):
-        return {}
+        return default
+
+
+def load_watch():
+    return _load_json(WATCH_FILE, {})
 
 
 def save_watch(d):
@@ -164,9 +175,24 @@ def path_for_id(video_id):
     return None
 
 
+def load_history():
+    return _load_json(HISTORY_FILE, [])
+
+
+def record_history(video_id, title):
+    """Trace des vidéos vues. Le fichier vidéo est supprimé juste après, mais on
+    doit pouvoir liker la vidéo APRÈS coup (la miniature, elle, survit)."""
+    hist = [h for h in load_history() if h.get("id") != video_id]
+    hist.insert(0, {"id": video_id, "title": title,
+                    "ts": datetime.datetime.now().isoformat(timespec="seconds")})
+    _atomic_write(HISTORY_FILE, json.dumps(hist[:HISTORY_MAX]))
+
+
 def mark_watched(video_id, reason):
     add_seen(video_id)
     p = path_for_id(video_id)
+    # titre relevé AVANT l'unlink : c'est la dernière occasion de le connaître
+    record_history(video_id, title_from_name(p.name) if p else video_id)
     if p and p.exists():
         p.unlink()
         log(f"watched ({reason}) -> deleted {p.name}")
@@ -202,6 +228,11 @@ def list_source(source, limit):
 
 def gather_candidates(limit_per_source):
     sources = [":ytsubs", ":ytrec"]
+    # ponytail: "similaire à ce que j'aime" = même chaîne que les vidéos likées.
+    # C'est le seul signal de similarité que YouTube expose déjà sous forme de
+    # liste, sans modèle ni dépendance. Passer aux mots-clés du titre seulement
+    # si ça se révèle trop étroit.
+    sources += [f"https://www.youtube.com/channel/{c}/videos" for c in liked_channels()]
     sources += [f'ytsearch{limit_per_source}:{t}' for t in THEMES]
     seen_ids, out = set(), []
     for src in sources:
@@ -277,7 +308,7 @@ def fetch_metadata(ids):
         return []
     cmd = ["yt-dlp", "--no-download", "--ignore-errors",
            "--cookies-from-browser", COOKIES_BROWSER,
-           "--print", "%(id)s\t%(like_count)s\t%(comment_count)s\t%(view_count)s\t%(duration)s\t%(live_status)s\t%(title)s"]
+           "--print", "%(id)s\t%(like_count)s\t%(comment_count)s\t%(view_count)s\t%(duration)s\t%(live_status)s\t%(channel_id)s\t%(title)s"]
     cmd += [f"https://www.youtube.com/watch?v={i}" for i in ids]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=60 * len(ids))
@@ -287,9 +318,9 @@ def fetch_metadata(ids):
     metas = []
     for line in out.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 7 or not is_valid_id(parts[0]):
+        if len(parts) != 8 or not is_valid_id(parts[0]):
             continue
-        vid, like, com, view, dur, live, title = parts
+        vid, like, com, view, dur, live, chan, title = parts
         metas.append({
             "id": vid,
             "like": int(like) if like.isdigit() else 0,
@@ -297,9 +328,79 @@ def fetch_metadata(ids):
             "view": int(view) if view.isdigit() else 0,
             "duration": int(dur) if dur.isdigit() else None,
             "live_status": None if live in ("NA", "None", "") else live,
+            "channel": chan if is_valid_channel(chan) else None,
             "title": title,
         })
     return metas
+
+
+_CHANNEL_RE = re.compile(r"UC[A-Za-z0-9_-]{22}")
+
+
+def is_valid_channel(c):
+    """Un id de chaîne part dans une URL construite : on le valide comme un id
+    vidéo, à l'entrée."""
+    return bool(_CHANNEL_RE.fullmatch(c or ""))
+
+
+def load_likes():
+    return _load_json(LIKES_FILE, {})
+
+
+def add_like(video_id, title):
+    """Like LOCAL : rien n'est envoyé à YouTube. Sert uniquement à orienter les
+    prochains téléchargements (voir liked_channels)."""
+    likes = load_likes()
+    if video_id in likes:
+        return
+    likes[video_id] = {"title": title, "channel": None,
+                       "ts": datetime.datetime.now().isoformat(timespec="seconds")}
+    _atomic_write(LIKES_FILE, json.dumps(likes))
+
+
+def resolve_like_channel(video_id):
+    """Récupère la chaîne d'une vidéo likée — le signal de similarité. Lent
+    (~5 s) donc appelé hors du chemin HTTP. Hors ligne -> None, réessayé au
+    refill suivant."""
+    cmd = ["yt-dlp", "--no-download", "--ignore-errors",
+           "--cookies-from-browser", COOKIES_BROWSER,
+           "--print", "%(channel_id)s",
+           f"https://www.youtube.com/watch?v={video_id}"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (subprocess.SubprocessError, OSError) as e:
+        log(f"resolve_like_channel error {video_id}: {e}")
+        return
+    lines = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+    cid = lines[0] if lines else ""
+    if not is_valid_channel(cid):
+        return
+    likes = load_likes()
+    if video_id in likes:
+        likes[video_id]["channel"] = cid
+        _atomic_write(LIKES_FILE, json.dumps(likes))
+        log(f"like: {video_id} -> chaîne {cid}")
+
+
+def liked_channels():
+    """Chaînes likées, les plus récentes d'abord, dédupliquées."""
+    entries = sorted(load_likes().values(),
+                     key=lambda l: l.get("ts") or "", reverse=True)
+    out = []
+    for e in entries:
+        c = e.get("channel")
+        if c and c not in out:
+            out.append(c)
+        if len(out) >= LIKED_CHANNELS_MAX:
+            break
+    return out
+
+
+def backfill_like_channels():
+    """Résout les chaînes des likes faits hors ligne (best-effort)."""
+    for vid, e in load_likes().items():
+        if not e.get("channel"):
+            resolve_like_channel(vid)
 
 
 def engagement_score(m):
@@ -311,6 +412,13 @@ def engagement_score(m):
     return (m["like"] / v) * 100 + (m["comment"] / v) * 500
 
 
+def ranked_score(m, liked):
+    """Score de classement = engagement + bonus si la vidéo vient d'une chaîne
+    likée. engagement_score reste pur (ratio seul) pour rester testable."""
+    s = engagement_score(m)
+    return s * LIKED_BOOST if m.get("channel") in liked else s
+
+
 def enough_signal(m):
     """Écarte les vidéos trop peu vues/likées : à 24 vues le ratio explose mais
     c'est du bruit, pas une bonne vidéo. Plancher à régler via MIN_VIEWS/MIN_LIKES."""
@@ -320,30 +428,21 @@ def enough_signal(m):
 def save_candidates(metas):
     """Écrit le top 50 (non vus, triés engagement) pour l'onglet 'à télécharger'."""
     seen = load_seen()
+    liked = liked_channels()
     ranked = sorted((m for m in metas if m["id"] not in seen),
-                    key=engagement_score, reverse=True)[:50]
+                    key=lambda m: ranked_score(m, liked), reverse=True)[:50]
     _atomic_write(CANDIDATES_FILE, json.dumps(ranked))
 
 
 def load_candidates():
-    if not CANDIDATES_FILE.exists():
-        return []
-    try:
-        return json.loads(CANDIDATES_FILE.read_text())
-    except (ValueError, OSError):
-        return []
+    return _load_json(CANDIDATES_FILE, [])
 
 
 MAX_FAILS = 3   # au-delà, on abandonne un id (vidéo cassée) au lieu de boucler
 
 
 def load_fails():
-    if not FAILS_FILE.exists():
-        return {}
-    try:
-        return json.loads(FAILS_FILE.read_text())
-    except (ValueError, OSError):
-        return {}
+    return _load_json(FAILS_FILE, {})
 
 
 def record_fail(vid):
@@ -394,6 +493,7 @@ def refill():
 def _refill():
     seed_seen_from_disk()
     sweep_stale_partials()
+    backfill_like_channels()   # likes faits hors ligne : chaîne encore inconnue
     log(f"refill: {dir_used_bytes() // 1024**2} MiB / {BUDGET_BYTES // 1024**2} MiB")
     # candidats en flat (rapide) -> métadonnées par chunks (coûteux) -> classement.
     pool = [c for c in gather_candidates(40) if is_wanted(c, load_seen())]
@@ -405,9 +505,10 @@ def _refill():
         chunk = [c["id"] for c in pool[i:i + METADATA_CHUNK]]
         i += METADATA_CHUNK
         seen = load_seen()
+        liked = liked_channels()
         good = [m for m in fetch_metadata(chunk)
                 if is_wanted(m, seen) and enough_signal(m)]
-        good.sort(key=engagement_score, reverse=True)
+        good.sort(key=lambda m: ranked_score(m, liked), reverse=True)
         for m in good:
             if needs_more(dir_used_bytes()):
                 log(f"refill: pick {m['id']} score={engagement_score(m):.1f} "
@@ -513,6 +614,38 @@ def title_from_name(name):
     return re.sub(r"\s*\[[A-Za-z0-9_-]{11}\]\.[^.]+$", "", name)
 
 
+_URL_ID_RE = re.compile(r"(?:v=|/shorts/|/embed/|/live/|youtu\.be/)([A-Za-z0-9_-]{11})")
+_YT_HOST_RE = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/")
+
+
+def id_from_url(text):
+    """Id d'une URL YouTube collée (watch?v=, youtu.be, /shorts/, /live/) ou id
+    brut. None si rien de valide -> le serveur refuse. On exige un hôte YouTube :
+    sinon n'importe quel '?v=' de 11 caractères passerait."""
+    text = (text or "").strip()
+    if is_valid_id(text):
+        return text
+    if not _YT_HOST_RE.match(text):
+        return None
+    m = _URL_ID_RE.search(text)
+    return m.group(1) if m else None
+
+
+def is_busy():
+    """Vrai si un refill/download tient le verrou. Sonde non bloquante : on prend
+    le verrou et on le rend aussitôt."""
+    with download_lock() as got:
+        return not got
+
+
+def history_items():
+    likes = load_likes()
+    return [{**h,
+             "liked": h.get("id") in likes,
+             "thumb": (THUMBS_DIR / f"{h.get('id')}.jpg").exists()}
+            for h in load_history()]
+
+
 def stock_items():
     items = []
     for p in sorted(list_stock_files(), key=lambda x: x.stat().st_mtime, reverse=True):
@@ -554,6 +687,14 @@ background:#111;color:#eee}header{position:sticky;top:0;background:#181818;
 padding:14px 20px;border-bottom:1px solid #2a2a2a;display:flex;gap:16px;align-items:center}
 h1{font-size:17px;margin:0;font-weight:600}.bar{color:#9a9a9a;font-size:13px}
 .bar b{color:#eee}main{padding:20px;max-width:1200px;margin:0 auto}
+.dlf{margin-left:auto;display:flex;gap:6px}
+.dlf input{background:#111;border:1px solid #333;border-radius:7px;color:#eee;
+padding:7px 10px;font-size:13px;width:250px}
+.dlf input:focus{outline:0;border-color:#2d6cdf}
+.go{background:#227a4b;flex:0 0 auto;font-size:15px;padding:6px 12px;line-height:1}
+.cyc{background:#333;flex:0 0 auto;font-size:16px;padding:6px 12px;line-height:1}
+.err{background:#4a1d1d;color:#f2b8b8;padding:10px 20px;font-size:13px;
+border-bottom:1px solid #6a2a2a}
 h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:#8a8a8a;
 margin:26px 0 12px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));
 gap:16px}.card{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:10px;overflow:hidden;
@@ -564,13 +705,23 @@ display:flex;align-items:center;justify-content:center;color:#444;font-size:32px
 .t{font-size:13px;font-weight:500;line-height:1.35;max-height:3.4em;overflow:hidden}
 .meta{font-size:12px;color:#8a8a8a}.row{display:flex;gap:8px;margin-top:auto}
 button{flex:1;border:0;border-radius:7px;padding:8px;font-size:13px;font-weight:600;
-cursor:pointer;color:#fff}.play{background:#2d6cdf}.del{background:#3a2020;color:#e88;flex:0 0 auto}
-.dl{background:#227a4b}button:disabled{opacity:.4;cursor:not-allowed}
+cursor:pointer;color:#fff}.play{background:#2d6cdf}
+.del{background:#3a2020;color:#e88;flex:0 0 auto;font-size:15px;padding:6px 12px;line-height:1}
+.dl{background:#227a4b;flex:0 0 auto;font-size:16px;padding:6px 12px;line-height:1}
+.lk{background:#2a2a2a;font-size:15px;padding:6px 12px;line-height:1}
+.lk.on{background:#1f4d33;color:#8fe0b0}
+button:disabled{opacity:.4;cursor:not-allowed}
 .empty{color:#666;padding:20px 0}.off{color:#c96;font-size:12px}
 </style></head><body>
-<header><h1>🎬 ytstock</h1><div class=bar id=bar>…</div></header>
+<header><h1>🎬 ytstock</h1><div class=bar id=bar>…</div>
+<form class=dlf id=dlf><input id=url placeholder="Coller une URL YouTube…" autocomplete=off>
+<button class=go type=submit title="Télécharger cette URL">⬇</button>
+<button class=cyc id=cyc type=button title="Relancer un cycle de téléchargement">⟳</button>
+</form></header>
+<div class=err id=err hidden></div>
 <main>
 <h2>En stock — à regarder</h2><div class=grid id=stock></div>
+<h2>Vues récemment — 👍 pour en télécharger des similaires</h2><div class=grid id=hist></div>
 <h2>À télécharger — les plus engageantes <span class=off id=offnote></span></h2>
 <div class=grid id=cand></div>
 </main>
@@ -579,7 +730,16 @@ const online = navigator.onLine;
 async function j(u,o){const r=await fetch(u,o);return r.json()}
 function card(html){const d=document.createElement('div');d.className='card';d.innerHTML=html;return d}
 function thumbStock(it){return it.thumb?`<img class=thumb src="/thumb/${it.id}">`:`<div class=ph>🎬</div>`}
-async function post(u){try{const r=await j(u,{method:'POST'});return r}catch(e){return {ok:false,err:'offline'}}}
+function fail(m){const e=document.getElementById('err');e.textContent=m;e.hidden=false}
+function ok(){document.getElementById('err').hidden=true}
+// un serveur arrêté ne doit plus ressembler à un bouton cassé : on distingue
+// panne réseau, statut HTTP et refus applicatif, et on l'affiche.
+async function post(u){
+ let r;
+ try{r=await fetch(u,{method:'POST'})}
+ catch(e){fail('Serveur injoignable — relance : python3 ytstock.py serve');return {ok:false}}
+ if(!r.ok){fail('Erreur serveur ('+r.status+')');return {ok:false}}
+ ok();return r.json()}
 async function load(){
  const st=await j('/api/stock');
  const el=document.getElementById('stock');el.innerHTML='';
@@ -587,12 +747,23 @@ async function load(){
  st.forEach(it=>{mib+=it.size_mib;
   const c=card(`${thumbStock(it)}<div class=body><div class=t>${esc(it.title)}</div>
    <div class=meta>${it.size_mib} Mo</div>
-   <div class=row><button class=play>▶ Lancer</button><button class=del>🗑</button></div></div>`);
+   <div class=row><button class=play>▶ Lancer</button><button class=del title=Supprimer>✕</button></div></div>`);
   c.querySelector('.play').onclick=async e=>{e.target.textContent='…';await post('/api/open?id='+it.id);e.target.textContent='▶ Lancer'};
   c.querySelector('.del').onclick=async()=>{if(confirm('Supprimer « '+it.title+' » ?')){await post('/api/delete?id='+it.id);load()}};
   el.appendChild(c)});
  if(!st.length)el.innerHTML='<div class=empty>Rien en stock pour l\\'instant.</div>';
  document.getElementById('bar').innerHTML=`<b>${st.length}</b> vidéos · <b>${(mib/1024).toFixed(1)}</b> Go`;
+ const hs=await j('/api/history');
+ const he=document.getElementById('hist');he.innerHTML='';
+ hs.forEach(it=>{
+  const c=card(`${thumbStock(it)}<div class=body><div class=t>${esc(it.title)}</div>
+   <div class=row><button class="lk${it.liked?' on':''}" title="J'aime — l'app en cherchera des similaires"
+   ${it.liked?'disabled':''}>${it.liked?'👍 ✓':'👍'}</button></div></div>`);
+  const b=c.querySelector('.lk');
+  if(!it.liked)b.onclick=async()=>{b.disabled=true;const r=await post('/api/like?id='+it.id);
+   if(r.ok){b.textContent='👍 ✓';b.classList.add('on')}else{b.disabled=false}};
+  he.appendChild(c)});
+ if(!hs.length)he.innerHTML='<div class=empty>Aucune vidéo vue pour l\\'instant.</div>';
  const cd=await j('/api/candidates');
  const ce=document.getElementById('cand');ce.innerHTML='';
  document.getElementById('offnote').textContent=online?'':'(hors ligne — téléchargement indispo)';
@@ -600,13 +771,29 @@ async function load(){
   const c=card(`<img class=thumb src="https://i.ytimg.com/vi/${m.id}/mqdefault.jpg" onerror="this.outerHTML='<div class=ph>🎬</div>'">
    <div class=body><div class=t>${esc(m.title||m.id)}</div>
    <div class=meta>❤ ${m.like} · 💬 ${m.comment} · 👁 ${m.view}</div>
-   <div class=row><button class=dl ${online?'':'disabled'}>⬇ Télécharger</button></div></div>`);
+   <div class=row><button class=dl title="Télécharger" ${online?'':'disabled'}>⬇</button></div></div>`);
   const b=c.querySelector('.dl');
-  if(online)b.onclick=async()=>{b.textContent='téléchargement…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent=r.busy?'démon occupé…':'échec';setTimeout(()=>{b.textContent='⬇ Télécharger';b.disabled=false},2500)}};
+  if(online)b.onclick=async()=>{b.textContent='téléchargement…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent=r.busy?'⏳':'✕';setTimeout(()=>{b.textContent='⬇';b.disabled=false},2500)}};
   ce.appendChild(c)});
  if(!cd.length)ce.innerHTML='<div class=empty>Pas encore de candidats (lance un refill en ligne).</div>';
 }
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function setBusy(b){const c=document.getElementById('cyc');c.disabled=b;c.textContent=b?'⏳':'⟳'}
+document.getElementById('cyc').onclick=async()=>{
+ const r=await post('/api/refill');
+ if(r.busy)fail('Un cycle est déjà en cours.');else if(r.ok)setBusy(true)};
+document.getElementById('dlf').onsubmit=async e=>{
+ e.preventDefault();
+ const u=document.getElementById('url');if(!u.value.trim())return;
+ const b=e.target.querySelector('.go');b.disabled=true;b.textContent='…';
+ const r=await post('/api/download?url='+encodeURIComponent(u.value));
+ b.disabled=false;b.textContent='⬇';
+ if(r.ok){u.value='';load()}
+ else fail(r.busy?'Occupé — un téléchargement est déjà en cours.'
+                :'Échec : URL invalide ou vidéo indisponible.')};
+// sonde légère : le refill dure des minutes, c'est le seul retour honnête sans
+// réécrire refill() en machine à états.
+setInterval(async()=>{try{setBusy((await j('/api/busy')).busy)}catch(e){}},3000);
 load();
 </script></body></html>"""
 
@@ -643,6 +830,10 @@ def serve():
                 self._json(stock_items())
             elif path == "/api/candidates":
                 self._json(load_candidates())
+            elif path == "/api/history":
+                self._json(history_items())
+            elif path == "/api/busy":
+                self._json({"busy": is_busy()})
             elif path.startswith("/thumb/"):
                 vid = path[len("/thumb/"):]
                 f = THUMBS_DIR / f"{vid}.jpg"
@@ -661,7 +852,17 @@ def serve():
             if origin not in allowed:
                 return self.send_error(403)
             path = urlparse(self.path).path
-            vid = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+            q = parse_qs(urlparse(self.path).query)
+            if path == "/api/refill":
+                # refill() dure des minutes : en tâche de fond, on répond tout de
+                # suite. Le verrou existant sert de garde anti-doublon.
+                if is_busy():
+                    return self._json({"ok": False, "busy": True})
+                threading.Thread(target=refill, daemon=True).start()
+                return self._json({"ok": True})
+            vid = (q.get("id") or [""])[0]
+            if path == "/api/download" and not vid:
+                vid = id_from_url((q.get("url") or [""])[0]) or ""
             if not valid_id(vid):
                 return self._json({"ok": False, "err": "bad id"}, 400)
             if path == "/api/open":
@@ -673,6 +874,15 @@ def serve():
                     self._json({"ok": False, "err": "not found"}, 404)
             elif path == "/api/delete":
                 mark_watched(vid, "ui")
+                self._json({"ok": True})
+            elif path == "/api/like":
+                # titre pris dans l'historique, jamais du client
+                title = next((h["title"] for h in load_history()
+                              if h.get("id") == vid), vid)
+                add_like(vid, title)
+                # résolution de la chaîne hors du chemin HTTP (~5 s)
+                threading.Thread(target=resolve_like_channel, args=(vid,),
+                                 daemon=True).start()
                 self._json({"ok": True})
             elif path == "/api/download":
                 with download_lock() as got:
@@ -692,10 +902,11 @@ def serve():
     url = f"http://127.0.0.1:{SERVE_PORT}"
     log(f"serve: {url}")
     print(f"ytstock UI → {url}  (Ctrl-C pour arrêter)")
-    try:
-        subprocess.Popen(["open", url])
-    except OSError:
-        pass
+    if not os.environ.get("YTSTOCK_NO_OPEN"):   # le .app ouvre lui-même sa fenêtre
+        try:
+            subprocess.Popen(["open", url])
+        except OSError:
+            pass
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -732,6 +943,28 @@ def run_self_check():
     assert title_from_name("La honte ｜ ARTE [0z8W4XQ6KOo].webm") == "La honte ｜ ARTE"
     assert title_from_name("no id here.mp4") == "no id here.mp4"
 
+    # id_from_url : formes acceptées pour le champ "coller une URL"
+    assert id_from_url("https://www.youtube.com/watch?v=0z8W4XQ6KOo") == "0z8W4XQ6KOo"
+    assert id_from_url("https://youtu.be/0z8W4XQ6KOo?t=42") == "0z8W4XQ6KOo"
+    assert id_from_url("https://www.youtube.com/shorts/0z8W4XQ6KOo") == "0z8W4XQ6KOo"
+    assert id_from_url("https://m.youtube.com/watch?v=0z8W4XQ6KOo&list=x") == "0z8W4XQ6KOo"
+    assert id_from_url("0z8W4XQ6KOo") == "0z8W4XQ6KOo"          # id brut
+    assert id_from_url("https://evil.example.com/?v=0z8W4XQ6KOo") is None  # hôte non YouTube
+    assert id_from_url("https://www.youtube.com/watch?v=trop court") is None
+    assert id_from_url("") is None and id_from_url(None) is None
+
+    # is_valid_channel : sert à construire une URL de chaîne
+    assert is_valid_channel("UC" + "a" * 22) is True
+    assert is_valid_channel("UCtrop-court") is False
+    assert is_valid_channel("../../etc/passwd12345678") is False
+
+    # ranked_score : un like pousse la chaîne, sans fausser engagement_score
+    base = {"like": 100, "comment": 10, "view": 10000, "channel": "UC" + "b" * 22}
+    assert ranked_score(base, []) == engagement_score(base)
+    assert ranked_score(base, ["UC" + "b" * 22]) > ranked_score(base, [])
+    assert ranked_score({"like": 1, "comment": 0, "view": 100}, ["UC" + "b" * 22]) \
+        == engagement_score({"like": 1, "comment": 0, "view": 100})   # sans chaîne
+
     # is_valid_id : charset strict (bloque injection via id de 11 chars hostile)
     assert is_valid_id("0z8W4XQ6KOo") is True
     assert is_valid_id('"><script>x') is False   # 11 chars mais charset interdit
@@ -746,11 +979,14 @@ def run_self_check():
 
     # Task 4 & 6: Persistent state and mark_watched (nested in temp dir)
     global STATE_DIR, SEEN_FILE, WATCH_FILE, VIDEO_DIR, FAILS_FILE
-    _saved_state = (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE)
+    global HISTORY_FILE, LIKES_FILE
+    _saved_state = (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE,
+                    HISTORY_FILE, LIKES_FILE)
     _saved_vd = VIDEO_DIR
     _tmp = Path(tempfile.mkdtemp())
     STATE_DIR, SEEN_FILE, WATCH_FILE = _tmp, _tmp / "seen.txt", _tmp / "watch.json"
     FAILS_FILE = _tmp / "fails.json"
+    HISTORY_FILE, LIKES_FILE = _tmp / "history.json", _tmp / "likes.json"
     VIDEO_DIR = _tmp
     try:
         ensure_state_dir()
@@ -787,8 +1023,35 @@ def run_self_check():
         assert "ggggggggggg" not in load_fails()
         record_fail("hhhhhhhhhhh"); clear_fail("hhhhhhhhhhh")
         assert "hhhhhhhhhhh" not in load_fails()        # succès efface le compteur
+        # historique : mark_watched garde le TITRE avant de supprimer le fichier,
+        # sinon impossible de liker la vidéo après coup
+        h = load_history()
+        assert h[0]["id"] == "eeeeeeeeeee" or any(x["id"] == "ddddddddddd" for x in h)
+        entry = next(x for x in h if x["id"] == "ddddddddddd")
+        assert entry["title"] == "Titre"          # pas le nom de fichier brut
+        mark_watched("iiiiiiiiiii", "test")        # aucun fichier local
+        assert next(x for x in load_history() if x["id"] == "iiiiiiiiiii")["title"] == "iiiiiiiiiii"
+        # pas de doublon : revoir une vidéo la remonte en tête
+        mark_watched("ddddddddddd", "test")
+        assert [x["id"] for x in load_history()].count("ddddddddddd") == 1
+        assert load_history()[0]["id"] == "ddddddddddd"
+        # cap de l'historique
+        for n in range(HISTORY_MAX + 5):
+            record_history(f"z{n:010d}", f"t{n}")
+        assert len(load_history()) == HISTORY_MAX
+
+        # likes locaux : rien n'est envoyé à YouTube, on retient juste le choix
+        add_like("jjjjjjjjjjj", "Un titre")
+        add_like("jjjjjjjjjjj", "Un titre")        # idempotent
+        assert list(load_likes()) == ["jjjjjjjjjjj"]
+        assert liked_channels() == []              # chaîne pas encore résolue
+        likes = load_likes()
+        likes["jjjjjjjjjjj"]["channel"] = "UC" + "a" * 22
+        _atomic_write(LIKES_FILE, json.dumps(likes))
+        assert liked_channels() == ["UC" + "a" * 22]
     finally:
-        STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE = _saved_state
+        (STATE_DIR, SEEN_FILE, WATCH_FILE, FAILS_FILE,
+         HISTORY_FILE, LIKES_FILE) = _saved_state
         VIDEO_DIR = _saved_vd
         shutil.rmtree(_tmp, ignore_errors=True)
 

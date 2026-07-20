@@ -1,6 +1,11 @@
+# Vidéos et miniatures téléchargées (le stock, pas le code)
 *.mp4
 *.webm
 *.mkv
+*.jpg
 *.part
 *.ytdl
+*.aria2__temp
+# État runtime local
 .ytstock/
+__pycache__/

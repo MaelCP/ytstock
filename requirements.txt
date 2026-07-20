@@ -1,0 +1,9 @@
+# ytstock n'utilise QUE la bibliothèque standard Python — aucun paquet PyPI.
+# `pip install -r requirements.txt` est donc un no-op (volontaire).
+#
+# Les vraies dépendances sont des outils système, installés par ./install.sh :
+#   - yt-dlp   (brew install yt-dlp)   extraction/téléchargement YouTube
+#   - aria2    (brew install aria2)    téléchargeur multi-connexions
+#   - deno     (brew install deno)     runtime JS pour résoudre le "n-challenge"
+#
+# Python 3.9+ requis (fourni avec macOS).
