@@ -43,9 +43,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>local.ytstock</string>
 <key>CFBundleExecutable</key><string>ytstock</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>ytstock</string>
 <key>LSUIElement</key><true/>
 </dict></plist>
 PLIST
+
+# Icône de l'app
+if [ -f "$REPO/assets/ytstock.icns" ]; then
+  mkdir -p "$APP/Contents/Resources"
+  cp "$REPO/assets/ytstock.icns" "$APP/Contents/Resources/ytstock.icns"
+fi
 
 # REPO est injecté en dur : l'app sait où vit le script quel que soit le dossier cloné.
 cat > "$APP/Contents/MacOS/ytstock" <<LAUNCH
