@@ -8,6 +8,7 @@ let QUALITIES = ["max", "1080", "720", "480", "360", "audio"]
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     var quality = "720"
+    var poll: Timer?
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -54,25 +55,54 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func download() {
         let clip = (NSPasteboard.general.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard clip.contains("youtu") else { return }
-        flash("…")
+        item.button?.title = "…"
         var comps = URLComponents(string: SERVER + "/api/download")!
         comps.queryItems = [.init(name: "q", value: quality), .init(name: "url", value: clip)]
         var req = URLRequest(url: comps.url!)
         req.httpMethod = "POST"
         req.setValue(SERVER, forHTTPHeaderField: "Origin")   // anti-CSRF du serveur
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            var sym = "✕"
-            if let d = data, let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-                if o["ok"] as? Bool == true { sym = "✓" }
-                else if o["busy"] as? Bool == true { sym = "⏳" }
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let o = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            let ok = o?["ok"] as? Bool == true
+            DispatchQueue.main.async {
+                if ok { self.startPolling() }        // la file/progression prend le relais
+                else { self.flash("✕") }
             }
-            DispatchQueue.main.async { self.flash(sym) }
+        }.resume()
+    }
+
+    // Interroge /api/queue : titre = "52% (2)" (% courant + en attente). File
+    // vide -> "Y" et on arrête le timer. Le POST étant instantané, c'est ça qui
+    // montre l'avancement au fil de l'eau.
+    func startPolling() {
+        poll?.invalidate()
+        poll = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in self.pollQueue() }
+        poll?.fire()
+    }
+
+    func pollQueue() {
+        URLSession.shared.dataTask(with: URL(string: SERVER + "/api/queue")!) { data, _, _ in
+            let items = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [[String: Any]] ?? []
+            let active = items.filter { ($0["state"] as? String) == "pending" || ($0["state"] as? String) == "downloading" }
+            let dl = active.first { ($0["state"] as? String) == "downloading" }
+            let waiting = active.count - (dl == nil ? 0 : 1)
+            DispatchQueue.main.async {
+                if active.isEmpty {
+                    self.poll?.invalidate(); self.poll = nil
+                    self.item.button?.title = "Y"
+                } else {
+                    let pct = (dl?["pct"] as? Int) ?? 0
+                    self.item.button?.title = waiting > 0 ? "\(pct)% (\(waiting))" : "\(pct)%"
+                }
+            }
         }.resume()
     }
 
     func flash(_ s: String) {
         item.button?.title = s
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.item.button?.title = "Y" }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            if self.poll == nil { self.item.button?.title = "Y" }
+        }
     }
 }
 

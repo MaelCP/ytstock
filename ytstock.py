@@ -10,6 +10,7 @@ import tempfile
 import shutil
 import subprocess
 import time
+import threading
 import fcntl
 import contextlib
 import plistlib
@@ -139,6 +140,96 @@ def _load_json(path, default):
         return json.loads(path.read_text())
     except (ValueError, OSError):
         return default
+
+
+# --- File d'attente de téléchargement (queue.json) -----------------------------
+# Empile les demandes UI/menu ; un seul worker (dans serve) draine, une à la
+# fois. Fichier plutôt que variable : survit au redémarrage, visible par l'UI,
+# inspectable. STATE_DIR lu à l'appel pour que le self-check (tmp dir) marche.
+_queue_lock = threading.Lock()
+_ACTIVE = ("pending", "downloading")
+
+
+def _queue_path():
+    return STATE_DIR / "queue.json"
+
+
+def load_queue():
+    return _load_json(_queue_path(), [])
+
+
+def _save_queue(q):
+    ensure_state_dir()
+    _atomic_write(_queue_path(), json.dumps(q))
+
+
+def queue_add(video_id, quality):
+    """Empile si pas déjà actif. Renvoie le nombre d'items actifs (dédoublonné)."""
+    with _queue_lock:
+        q = load_queue()
+        if not any(it["id"] == video_id and it["state"] in _ACTIVE for it in q):
+            q.append({"id": video_id, "quality": quality or "",
+                      "title": video_id, "state": "pending", "pct": 0})
+            # on ne garde que les 20 derniers terminés, sinon le fichier enfle
+            done = [it for it in q if it["state"] not in _ACTIVE]
+            q = [it for it in q if it["state"] in _ACTIVE] + done[-20:]
+            _save_queue(q)
+        return sum(1 for it in q if it["state"] in _ACTIVE)
+
+
+def queue_update(video_id, **fields):
+    """Met à jour l'item ACTIF de cet id (un seul, garanti par le dédoublonnage)."""
+    with _queue_lock:
+        q = load_queue()
+        for it in q:
+            if it["id"] == video_id and it["state"] in _ACTIVE:
+                it.update(fields)
+                break
+        _save_queue(q)
+
+
+def queue_next():
+    with _queue_lock:
+        for it in load_queue():
+            if it["state"] == "pending":
+                return dict(it)
+        return None
+
+
+def queue_worker():
+    """Boucle du worker (thread dans serve). Le flock (download_lock) sérialise
+    avec le refill de serve ET le démon : jamais deux yt-dlp en parallèle."""
+    while True:
+        item = queue_next()
+        if not item:
+            time.sleep(1)
+            continue
+        with download_lock() as got:
+            if not got:                     # démon/refill tient le verrou -> plus tard
+                time.sleep(2)
+                continue
+            vid, quality = item["id"], item["quality"] or None
+            queue_update(vid, state="downloading", pct=0)
+            ok = download(vid, quality,
+                          on_pct=lambda p, _v=vid: queue_update(_v, pct=p))
+            if ok:
+                add_seen(vid)
+                clear_fail(vid)
+            else:
+                record_fail(vid)
+            queue_update(vid, state="done" if ok else "failed",
+                         pct=100 if ok else 0)
+
+
+# --- Progression : extraction du % d'une ligne yt-dlp/aria2c --------------------
+_PCT_RE = re.compile(r"(\d{1,3})(?:\.\d+)?%")
+
+
+def _parse_pct(line):
+    """% d'une ligne de sortie, ou None. Attrape aria2c '(98%)' et yt-dlp
+    '[download] 98.0%'. Borné à 100."""
+    m = _PCT_RE.search(line)
+    return min(int(m.group(1)), 100) if m else None
 
 
 # Task 5: Position de lecture via VLC (source de vérité pour "en cours" / "fini")
@@ -300,9 +391,10 @@ QUALITIES = {
 
 
 # Task 8: Download via yt-dlp + aria2c
-def download(video_id, quality=None):
+def download(video_id, quality=None, on_pct=None):
     """quality=None -> plafond démon (MAX_HEIGHT, pour le budget). Sinon un choix
-    utilisateur de QUALITIES (résolution ou audio)."""
+    utilisateur de QUALITIES (résolution ou audio). on_pct(int) rappelé avec le %
+    au fil de l'eau (None pour le démon : aucun suivi)."""
     THUMBS_DIR.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(VIDEO_DIR / "%(title)s [%(id)s].%(ext)s")
     thumb_tmpl = "thumbnail:" + str(THUMBS_DIR / "%(id)s.%(ext)s")
@@ -327,8 +419,21 @@ def download(video_id, quality=None):
         "--", video_id,
     ]
     try:
-        r = subprocess.run(cmd, timeout=3600)
-        ok = r.returncode == 0
+        # Popen + lecture ligne à ligne : on parse le % (aria2c/yt-dlp) sans
+        # changer la commande. Throttle ~2x/s pour ne pas marteler queue.json.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        last = 0.0
+        for line in proc.stdout:
+            if on_pct is None:
+                continue
+            pct = _parse_pct(line)
+            now = time.monotonic()
+            if pct is not None and now - last > 0.5:
+                last = now
+                on_pct(pct)
+        proc.wait(timeout=3600)
+        ok = proc.returncode == 0
     except (subprocess.SubprocessError, OSError) as e:
         log(f"download error {video_id}: {e}")
         ok = False
@@ -824,6 +929,14 @@ transform:translateX(-100%);transition:.2s;z-index:40;padding:18px;display:flex;
 .mgo{background:#227a4b;border-radius:7px;color:#fff;font-size:15px;padding:0 12px;flex:0 0 auto}
 .mcyc{background:#333;border-radius:8px;color:#fff;font-size:14px;padding:10px;width:100%;font-weight:600}
 .err{background:#4a1d1d;color:#f2b8b8;padding:10px 20px;font-size:13px;border-bottom:1px solid #6a2a2a}
+.queue{background:#141414;border-bottom:1px solid #2a2a2a;padding:8px 20px}
+.queue h3{font-size:12px;color:#8ab;margin:0 0 6px;text-transform:uppercase;letter-spacing:.5px}
+.qrow{display:flex;align-items:center;gap:10px;padding:3px 0;font-size:12px}
+.qt{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#ccc}
+.qbar{flex:0 0 120px;height:6px;background:#333;border-radius:3px;overflow:hidden}
+.qfill{height:100%;background:#2d6cdf;transition:width .4s}
+.qpct{flex:0 0 64px;text-align:right;color:#9ab;font-variant-numeric:tabular-nums}
+.qrow.wait .qfill{background:#555}.qrow.fail .qt{color:#f2b8b8}
 </style></head><body>
 <div class=ovl id=ovl></div>
 <nav class=drawer id=drawer>
@@ -846,6 +959,7 @@ transform:translateX(-100%);transition:.2s;z-index:40;padding:18px;display:flex;
 </nav>
 <header><button class=burger id=burger title=Menu>☰</button><h1>🎬 ytstock</h1><div class=bar id=bar>…</div></header>
 <div class=err id=err hidden></div>
+<div class=queue id=queue hidden></div>
 <main>
  <section data-view=encours hidden><h2>En cours — reprendre là où tu t'es arrêté</h2><div class=grid id=g-encours></div></section>
  <section data-view=stock><h2>Téléchargées — à regarder</h2><div class=grid id=g-stock></div></section>
@@ -903,10 +1017,26 @@ function renderCand(cd){const gc=document.getElementById('g-cand');gc.innerHTML=
    <div class=body><div class=t>${esc(m.title||m.id)}</div><div class=meta>❤ ${m.like} · 💬 ${m.comment} · 👁 ${m.view}</div>
    <div class=row><button class=dl title=Télécharger ${online?'':'disabled'}>⬇</button></div></div>`);
   const b=c.querySelector('.dl');
-  if(online)b.onclick=async()=>{b.textContent='…';b.disabled=true;const r=await post('/api/download?id='+m.id);if(r.ok){load()}else{b.textContent=r.busy?'⏳':'✕';setTimeout(()=>{b.textContent='⬇';b.disabled=false},2500)}};
+  if(online)b.onclick=async()=>{b.disabled=true;const r=await post('/api/download?id='+m.id);
+   b.textContent=r.ok?'✓ en file':'✕';setTimeout(()=>{b.textContent='⬇';b.disabled=false},2000);if(r.ok)pollQueue()};
   gc.appendChild(c)});
  if(!cd.length)gc.innerHTML='<div class=empty>Pas encore de suggestions (lance un cycle en ligne).</div>';
 }
+let _qActive=0;
+function renderQueue(qs){
+ const box=document.getElementById('queue');
+ const act=qs.filter(it=>it.state=='pending'||it.state=='downloading');
+ box.hidden=!act.length;
+ box.innerHTML=act.length?("<h3>File d'attente — "+act.length+"</h3>"+act.map(it=>{
+   const dl=it.state=='downloading',p=dl?it.pct:0;
+   return `<div class="qrow ${dl?'':'wait'}"><div class=qt>${esc(it.title||it.id)}</div>
+     <div class=qbar><div class=qfill style="width:${p}%"></div></div>
+     <div class=qpct>${dl?it.pct+'%':'en attente'}</div></div>`}).join('')):'';
+}
+async function pollQueue(){try{const qs=await j('/api/queue');renderQueue(qs);
+ const a=qs.filter(it=>it.state=='pending'||it.state=='downloading').length;
+ if(a<_qActive)load();        // une vidéo vient de finir -> le stock a changé
+ _qActive=a;}catch(e){}}
 async function load(){
  const st=await j('/api/stock');renderStock(st);
  const mib=st.reduce((a,b)=>a+b.size_mib,0);
@@ -927,15 +1057,16 @@ document.getElementById('dlf').onsubmit=async e=>{e.preventDefault();
  const b=e.target.querySelector('.mgo');b.disabled=true;b.textContent='…';
  const q=document.getElementById('q').value;
  const r=await post('/api/download?q='+q+'&url='+encodeURIComponent(u.value));b.disabled=false;b.textContent='⬇';
- if(r.ok){u.value='';selectView('stock');showMenu(false);load()}
- else fail(r.busy?'Occupé — un téléchargement est déjà en cours.':'Échec : URL invalide ou vidéo indisponible.')};
+ if(r.ok){u.value='';showMenu(false);pollQueue()}   // empilé -> la file se met à jour, pas le stock
+ else fail('Échec : URL invalide ou vidéo indisponible.')};
 // sonde légère : le refill dure des minutes, seul retour honnête sans machine à états.
 setInterval(async()=>{try{setBusy((await j('/api/busy')).busy)}catch(e){}},3000);
 // rafraîchit les cartes : le démon déplace les vidéos vues (En cours -> Vues
 // récemment) sans que la page le sache. On ne recharge PAS pendant qu'un menu
 // est ouvert pour ne pas casser une interaction.
 setInterval(()=>{if(!document.getElementById('drawer').classList.contains('show'))load()},15000);
-load();
+setInterval(pollQueue,1000);   // file + progression : retour rapide
+load();pollQueue();
 </script></body></html>"""
 
 
@@ -975,6 +1106,8 @@ def serve():
                 self._json(history_items())
             elif path == "/api/busy":
                 self._json({"busy": is_busy()})
+            elif path == "/api/queue":
+                self._json(load_queue())
             elif path.startswith("/thumb/"):
                 vid = path[len("/thumb/"):]
                 f = THUMBS_DIR / f"{vid}.jpg"
@@ -1031,20 +1164,15 @@ def serve():
                 quality = (q.get("q") or [""])[0]
                 if quality not in QUALITIES:
                     quality = None                    # défaut = plafond démon
-                with download_lock() as got:
-                    if not got:                       # démon en train de télécharger
-                        return self._json({"ok": False, "busy": True})
-                    ok = download(vid, quality)
-                    if ok:
-                        add_seen(vid)
-                        clear_fail(vid)
-                    else:
-                        record_fail(vid)
-                self._json({"ok": ok})
+                # on empile et on répond tout de suite : le worker draine, une à
+                # la fois. Plus de refus "busy" -> on peut enchaîner les URLs.
+                n = queue_add(vid, quality)
+                self._json({"ok": True, "queued": True, "n": n})
             else:
                 self.send_error(404)
 
     srv = ThreadingHTTPServer(("127.0.0.1", SERVE_PORT), H)
+    threading.Thread(target=queue_worker, daemon=True).start()
     url = f"http://127.0.0.1:{SERVE_PORT}"
     log(f"serve: {url}")
     print(f"ytstock UI → {url}  (Ctrl-C pour arrêter)")
@@ -1217,6 +1345,23 @@ def run_self_check():
         save_candidates([{"id": "lllllllllll", "title": "x", "like": 9, "comment": 9,
                           "view": 9999, "channel": "UC" + "c" * 22}])
         assert load_candidates() == []               # filtré (chaîne évitée)
+
+        # progression : parse du % (aria2c, yt-dlp, ligne sans %)
+        assert _parse_pct("[#812edb 43MiB/43MiB(98%) CN:2 DL:553KiB]") == 98
+        assert _parse_pct("[download] 100.0% of 43MiB") == 100
+        assert _parse_pct("[Merger] Merging formats") is None
+
+        # file d'attente : empile, dédoublonne, met à jour, draine (FIFO)
+        assert load_queue() == []
+        assert queue_add("mmmmmmmmmmm", "720") == 1
+        assert queue_add("mmmmmmmmmmm", "720") == 1        # doublon actif ignoré
+        assert queue_add("nnnnnnnnnnn", None) == 2
+        assert queue_next()["id"] == "mmmmmmmmmmm"         # FIFO
+        queue_update("mmmmmmmmmmm", state="downloading", pct=42)
+        assert next(it for it in load_queue()
+                    if it["id"] == "mmmmmmmmmmm")["pct"] == 42
+        queue_update("mmmmmmmmmmm", state="done", pct=100)
+        assert queue_next()["id"] == "nnnnnnnnnnn"         # le suivant vient
     finally:
         (STATE_DIR, SEEN_FILE, FAILS_FILE,
          HISTORY_FILE, LIKES_FILE, DISLIKES_FILE) = _saved_state
