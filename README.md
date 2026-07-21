@@ -29,7 +29,8 @@ prérequis sont des outils système (`yt-dlp`, `aria2`, `deno`).
 - **Application macOS** : un clic lance démon + serveur + fenêtre dédiée.
 - **Barre de menu** : un « Y » en haut de l'écran (`ytstock-menu.app`). Copie un
   lien YouTube, clique, il l'ajoute à la file (avec choix de qualité) — sans
-  ouvrir la fenêtre. Client léger qui réutilise le serveur.
+  ouvrir la fenêtre. Si le serveur n'est pas lancé, il le **démarre tout seul**
+  (`open -a ytstock` → démon + serveur) puis réessaie : le menu est autonome.
 
 ## Prérequis
 
