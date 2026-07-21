@@ -52,7 +52,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openApp() { let p = Process(); p.launchPath = "/usr/bin/open"; p.arguments = ["-a", "ytstock"]; try? p.run() }
     @objc func quit() { NSApp.terminate(nil) }
 
-    @objc func download() {
+    @objc func download() { doDownload(retry: true) }
+
+    // retry: si le serveur est injoignable, on démarre ytstock.app (démon +
+    // serveur) et on réessaie une fois -> la barre de menu est autonome.
+    func doDownload(retry: Bool) {
         let clip = (NSPasteboard.general.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard clip.contains("youtu") else { return }
         item.button?.title = "…"
@@ -61,13 +65,38 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var req = URLRequest(url: comps.url!)
         req.httpMethod = "POST"
         req.setValue(SERVER, forHTTPHeaderField: "Origin")   // anti-CSRF du serveur
-        URLSession.shared.dataTask(with: req) { data, _, _ in
+        URLSession.shared.dataTask(with: req) { data, _, err in
+            if err != nil {                      // serveur pas démarré
+                if retry {
+                    DispatchQueue.main.async { self.item.button?.title = "⏳" }   // démarrage…
+                    self.bootServer { self.doDownload(retry: false) }
+                } else {
+                    DispatchQueue.main.async { self.flash("✕") }
+                }
+                return
+            }
             let o = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
             let ok = o?["ok"] as? Bool == true
             DispatchQueue.main.async {
                 if ok { self.startPolling() }        // la file/progression prend le relais
                 else { self.flash("✕") }
             }
+        }.resume()
+    }
+
+    // Lance ytstock.app (démon + serveur, sans dépendre du chemin du dépôt) puis
+    // attend que :8787 réponde avant de rappeler `done`.
+    func bootServer(_ done: @escaping () -> Void) {
+        let p = Process(); p.launchPath = "/usr/bin/open"; p.arguments = ["-a", "ytstock"]
+        try? p.run()
+        waitUp(tries: 60, done: done)
+    }
+
+    func waitUp(tries: Int, done: @escaping () -> Void) {
+        guard tries > 0 else { DispatchQueue.main.async { self.flash("✕") }; return }
+        URLSession.shared.dataTask(with: URL(string: SERVER + "/api/queue")!) { _, _, err in
+            if err == nil { done() }
+            else { DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.waitUp(tries: tries - 1, done: done) } }
         }.resume()
     }
 
