@@ -19,12 +19,17 @@ prérequis sont des outils système (`yt-dlp`, `aria2`, `deno`).
   **finie** (position VLC à ≤ 20 s de la fin, durée via `ffprobe`).
 - **👍 local** : liker une vidéo vue oriente les prochains téléchargements vers la
   **même chaîne** (rien n'est envoyé à YouTube, aucun compte modifié).
-- **Interface web** : coller une URL pour télécharger direct, relancer un cycle,
-  gérer le stock. Marche hors ligne pour tout ce qui est déjà téléchargé.
+- **File d'attente + progression** : coller plusieurs liens d'affilée les
+  **empile** ; un worker les télécharge un par un. Le `%` d'avancement s'affiche
+  dans la fenêtre (mini-barre par vidéo) **et** dans l'icône de la barre de menu
+  (`52% (2)` = 52 % sur la vidéo en cours, 2 en attente). Plus de refus « occupé ».
+- **Interface web** : coller une URL pour télécharger, relancer un cycle,
+  gérer le stock, suivre la file d'attente. Marche hors ligne pour tout ce qui
+  est déjà téléchargé.
 - **Application macOS** : un clic lance démon + serveur + fenêtre dédiée.
 - **Barre de menu** : un « Y » en haut de l'écran (`ytstock-menu.app`). Copie un
-  lien YouTube, clique, il l'envoie à l'app pour téléchargement (avec choix de
-  qualité) — sans ouvrir la fenêtre. Client léger qui réutilise le serveur.
+  lien YouTube, clique, il l'ajoute à la file (avec choix de qualité) — sans
+  ouvrir la fenêtre. Client léger qui réutilise le serveur.
 
 ## Prérequis
 
@@ -62,15 +67,37 @@ Pour éviter cette étape, place les vidéos hors zone protégée :
 
 ## Utilisation
 
+Le plus simple, `open -a ytstock`, lance tout d'un coup. Sinon, chaque
+sous-commande fait une chose :
+
 ```sh
 open -a ytstock                 # tout se lance : démon + serveur + fenêtre
-# ou, sans l'app :
+# ou, à la main :
 python3 ytstock.py serve        # interface web → http://127.0.0.1:8787
 python3 ytstock.py daemon       # remplissage/nettoyage automatique en continu
-python3 ytstock.py refill       # un seul cycle de remplissage
-python3 ytstock.py status       # état du stock
+python3 ytstock.py refill       # un seul cycle de remplissage, puis s'arrête
+python3 ytstock.py status       # état du stock (nombre de vidéos, Go utilisés)
 python3 ytstock.py --self-check # tests intégrés
 ```
+
+### `serve` vs `daemon` — qui fait quoi
+
+Ce sont **deux processus séparés**, faits pour tourner en même temps :
+
+- **`serve`** = l'**interface** (serveur web sur `127.0.0.1:8787`). Il sert la
+  page, répond aux clics et à la barre de menu, et contient le **worker de la
+  file d'attente** : c'est lui qui télécharge ce que *tu* demandes, une vidéo à
+  la fois, en publiant la progression sur `GET /api/queue`.
+- **`daemon`** = l'**automate de fond**. Il remplit le stock tout seul (jusqu'au
+  budget disque), lit la position de reprise VLC et supprime les vidéos finies.
+  Il n'a pas besoin de `serve` pour tourner.
+
+Les deux téléchargent, donc ils se partagent un **verrou fichier** (`flock`) :
+jamais deux `yt-dlp` en même temps. Si le démon télécharge, ta file attend
+sagement son tour (et inversement) — aucun conflit, aucun doublon.
+
+Pour l'usage courant tu ne lances ni l'un ni l'autre à la main : `open -a
+ytstock` démarre les deux (plus la fenêtre) et ne relance que ce qui manque.
 
 ## Configuration
 
@@ -91,12 +118,23 @@ thèmes de recherche (`THEMES`), bonus des chaînes likées (`LIKED_BOOST`).
    likées, recherches thématiques) via `yt-dlp --flat-playlist` (rapide).
 2. `fetch_metadata` récupère like/vues/commentaires par lots et les classe.
 3. `download` télécharge en ≤720p via `aria2c` tant que le budget n'est pas atteint.
+   Il lit la sortie de `yt-dlp`/`aria2c` ligne par ligne pour en extraire le `%`.
 4. Le démon lit la position de reprise que VLC enregistre par fichier
    (`org.videolan.vlc.plist`) : une vidéo commencée reste en stock (onglet
    « En cours »), et n'est supprimée que quand sa position atteint la fin.
 
-Le tout est sérialisé par un verrou fichier (`flock`) : démon et interface ne
-téléchargent jamais le même fichier en même temps.
+### File d'attente
+
+Quand tu colles un lien (fenêtre ou barre de menu), `POST /api/download`
+**n'attend pas** : il ajoute un élément à `.ytstock/queue.json`
+(`{id, quality, state, pct}`) et répond aussitôt. Le worker de `serve` prend le
+prochain `pending`, le passe en `downloading` en écrivant le `%` au fil de l'eau,
+puis `done`/`failed`. La fenêtre et le menu lisent `GET /api/queue` toutes les
+secondes pour afficher la file et la progression. Un même lien déjà en file n'est
+pas ré-empilé (dédoublonnage).
+
+Le tout est sérialisé par un verrou fichier (`flock`) : démon, worker et
+interface ne téléchargent jamais le même fichier en même temps.
 
 ## Licence
 

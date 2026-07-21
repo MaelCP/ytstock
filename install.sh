@@ -120,8 +120,25 @@ python3 "$REPO/ytstock.py" --self-check
 cat <<DONE
 
 ✅ Installé.
-   • Lance l'app : open -a ytstock   (ou double-clic sur ytstock dans Applications)
-   • Ou en terminal : python3 "$REPO/ytstock.py" serve
+
+   ▸ Le plus simple — tout en un clic :
+       open -a ytstock
+     Ça démarre les DEUX processus + la fenêtre, et ne relance que ce qui manque :
+       • daemon = remplit le stock tout seul et supprime les vidéos finies
+       • serve  = l'interface web (http://127.0.0.1:8787) + le worker qui
+                  télécharge ce que TU demandes, un lien à la fois, avec le %
+
+   ▸ Barre de menu (le « Y » en haut de l'écran) :
+       open -a ytstock-menu
+     Copie un lien YouTube → clique → il s'ajoute à la file. Colle-en plusieurs
+     d'affilée : ils s'empilent et se téléchargent l'un après l'autre, le %
+     s'affiche dans l'icône (ex. « 52% (2) ») et dans la fenêtre.
+
+   ▸ À la main (sans les apps), dans deux terminaux :
+       python3 "$REPO/ytstock.py" serve     # interface + téléchargements demandés
+       python3 "$REPO/ytstock.py" daemon    # remplissage/nettoyage automatique
+     Autres commandes : refill (un cycle), status (état), --self-check (tests).
+
    Les vidéos vont dans ~/Downloads/videos (change avec la variable YTSTOCK_DIR).
 
 ⚠️  ACCÈS DISQUE (une seule fois) : si le dossier des vidéos est dans un
