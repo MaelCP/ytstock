@@ -68,8 +68,12 @@ Pour éviter cette étape, place les vidéos hors zone protégée :
 
 ## Utilisation
 
-Le plus simple, `open -a ytstock`, lance tout d'un coup. Sinon, chaque
-sous-commande fait une chose :
+Le plus simple, **double-clic sur l'icône `ytstock`** (dans le Finder ▸
+Applications ou le Launchpad) — équivalent à `open -a ytstock` : ça lance tout
+d'un coup (démon + serveur + fenêtre). Pareil pour `ytstock-menu` (le « Y »).
+Pour les garder à portée : ouvre l'app puis clic droit sur son icône du Dock ▸
+*Options ▸ Garder dans le Dock*. En ligne de commande, chaque sous-commande fait
+une chose :
 
 ```sh
 open -a ytstock                 # tout se lance : démon + serveur + fenêtre
