@@ -79,13 +79,17 @@ curl -s -o /dev/null --max-time 1 "$URL" || {
   done
 }
 echo "fenêtre"
+# Pas d'exec : sinon le processus de l'app DEVIENT Chrome, macOS croit l'app
+# "déjà lancée" et un nouveau clic ne relance plus démon/serveur. On détache la
+# fenêtre (nohup &) et on sort -> chaque clic re-vérifie tout.
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 if [ -x "$CHROME" ]; then
   # profil dédié = vraie fenêtre app même si Chrome tourne déjà
-  exec arch -arm64 "$CHROME" --app="$URL" --user-data-dir="$STATE/chrome"
+  nohup arch -arm64 "$CHROME" --app="$URL" --user-data-dir="$STATE/chrome" >/dev/null 2>&1 &
 else
-  exec open "$URL"   # pas de Chrome : navigateur par défaut, onglet normal
+  open "$URL"   # pas de Chrome : navigateur par défaut, onglet normal
 fi
+exit 0
 LAUNCH
 chmod +x "$APP/Contents/MacOS/ytstock"
 codesign --force --deep --sign - "$APP" 2>/dev/null || true
