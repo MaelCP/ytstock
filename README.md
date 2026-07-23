@@ -104,6 +104,22 @@ sagement son tour (et inversement) — aucun conflit, aucun doublon.
 Pour l'usage courant tu ne lances ni l'un ni l'autre à la main : `open -a
 ytstock` démarre les deux (plus la fenêtre) et ne relance que ce qui manque.
 
+## Piloter depuis Claude Code (MCP)
+
+Un serveur **MCP** optionnel (`mcp/ytstock_mcp.py`, stdlib, aucune dépendance)
+permet de dire à Claude Code « télécharge cette vidéo » ou « télécharge 4 vidéos
+sur la guerre » et qu'il le fasse via un outil. Il tape sur l'API HTTP locale
+existante — **rien à changer dans `ytstock.py`**, et non installé = rien ne change.
+
+```sh
+claude mcp add ytstock -s user -- python3 "$PWD/mcp/ytstock_mcp.py"
+```
+
+Outils exposés : `download(url, quality?)`, `search_and_download(query, count?,
+quality?)`, `queue_status()`, `list_stock()`, `play(id)`. Si le serveur est
+éteint, l'outil lance `ytstock.app` tout seul puis réessaie. Test intégré :
+`python3 mcp/ytstock_mcp.py --self-check`.
+
 ## Configuration
 
 Deux variables d'environnement :
